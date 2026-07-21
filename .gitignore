@@ -1,0 +1,22 @@
+# Binari compilati
+gpu_forwarder
+hello_doca
+udp_forwarder
+
+# Object files e file intermedi
+*.o
+*.d
+
+# Binari generici (qualsiasi eseguibile senza estensione in sottocartelle)
+**/build/
+**/builddir/
+
+# Editor e IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store

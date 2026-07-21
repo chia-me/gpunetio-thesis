@@ -1,0 +1,61 @@
+# Makefile.common — includi questo in ogni progetto con:
+#   REPO_ROOT := $(dir $(lastword $(MAKEFILE_LIST)))/..
+#   include $(REPO_ROOT)/Makefile.common
+#
+# Per sovrascrivere i path in ambienti diversi:
+#   make CUDA_HOME=/usr/local/cuda-12.0
+#   make DOCA_LIB=/opt/mellanox/doca/lib/aarch64-linux-gnu
+
+# ── Header DOCA: sempre dal repo (funziona anche offline) ─────────────────
+REPO_ROOT ?= $(shell git -C $(dir $(firstword $(MAKEFILE_LIST))) rev-parse --show-toplevel 2>/dev/null || echo $(dir $(firstword $(MAKEFILE_LIST)))/..)
+DOCA_INC  := $(REPO_ROOT)/vendor/doca/include
+
+# ── Librerie DOCA: dal sistema (solo sul server con DOCA installato) ───────
+DOCA_LIB  ?= /opt/mellanox/doca/lib/x86_64-linux-gnu
+
+# ── CUDA: dal sistema ──────────────────────────────────────────────────────
+CUDA_HOME ?= /usr/local/cuda
+CUDA_INC   := $(CUDA_HOME)/include
+CUDA_LIB   := $(CUDA_HOME)/lib64
+CC          := gcc
+NVCC        := $(CUDA_HOME)/bin/nvcc
+
+# ── Define comuni ──────────────────────────────────────────────────────────
+DEFINES := -DDOCA_ALLOW_EXPERIMENTAL_API
+
+# ── Flag C (file .c) ───────────────────────────────────────────────────────
+CFLAGS := -O2 -Wall -Wno-missing-braces $(DEFINES) \
+          -I$(DOCA_INC) -I$(CUDA_INC)
+
+# ── Flag CUDA (file .cu) ───────────────────────────────────────────────────
+# -rdc=true: relocatable device code, necessario per libdoca_gpunetio_device.a
+# -gencode: genera codice per sm_75 sm_80 sm_86 sm_90 in un unico binario
+NVFLAGS := -O2 $(DEFINES) \
+           -I$(DOCA_INC) -I$(CUDA_INC) \
+           -forward-unknown-to-host-compiler \
+           -rdc=true \
+           -gencode arch=compute_75,code=sm_75 \
+           -gencode arch=compute_80,code=sm_80 \
+           -gencode arch=compute_86,code=sm_86 \
+           -gencode arch=compute_90,code=sm_90
+
+# ── Flag di link per programmi GPU (usa nvcc come linker) ──────────────────
+GPU_LDFLAGS := \
+    -L$(DOCA_LIB) -Xlinker -rpath -Xlinker $(DOCA_LIB) \
+    -L$(CUDA_LIB) -Xlinker -rpath -Xlinker $(CUDA_LIB) \
+    -ldoca_eth -ldoca_flow -ldoca_common -ldoca_gpunetio \
+    $(DOCA_LIB)/libdoca_gpunetio_device.a \
+    -lcuda -lcudart
+
+# ── Flag di link per programmi CPU-only ────────────────────────────────────
+CPU_LDFLAGS := \
+    -L$(DOCA_LIB) -Wl,-rpath,$(DOCA_LIB) \
+    -ldoca_eth -ldoca_flow -ldoca_common
+
+# ── Regola generica: .c → .o ───────────────────────────────────────────────
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# ── Regola generica: .cu → .o ─────────────────────────────────────────────
+%.o: %.cu
+	$(NVCC) $(NVFLAGS) -c -o $@ $<
