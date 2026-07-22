@@ -1,5 +1,6 @@
 # Binari compilati
 gpu_forwarder
+gpu_bridge
 hello_doca
 udp_forwarder
 
