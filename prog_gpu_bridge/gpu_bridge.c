@@ -239,7 +239,6 @@ static doca_error_t setup_port_rxq(struct bridge_port *port,
 
     /* Allinea alla page size (richiesto da doca_gpu_mem_alloc) */
     cyclic_buf_size = (uint32_t)ALIGN_UP(cyclic_buf_size, page_sz);
-    port->rxq_buf_size = cyclic_buf_size;
 
     /* ── Crea il mmap che descrive il buffer GPU alla NIC ────────────────
      * Il mmap è l'oggetto DOCA che registra una regione di memoria GPU

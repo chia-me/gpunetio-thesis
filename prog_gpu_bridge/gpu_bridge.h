@@ -3,10 +3,9 @@
  *
  * Il bridge collega due porte fisiche della BF2 (ad:00.0 e ad:00.1).
  * Ogni pacchetto che arriva su una porta viene processato dalla A30X:
- *   - backward learning: il src_mac viene associato alla porta di ingresso
- *   - FIB lookup: si cerca la porta di uscita per il dst_mac
+ *   - backward learning: il src_mac viene associato ad una porta di ingresso
+ *   - FIB lookup: il src_mac è noto, allora si cerca la porta di uscita per il dst_mac
  *   - forward/drop: il pacchetto viene inviato sull'altra porta o droppato
- * Tutto avviene nella GPU senza coinvolgimento del CPU per singolo pacchetto.
  */
 
 #ifndef GPU_BRIDGE_H
@@ -33,16 +32,17 @@
  * COSTANTI — CODA DI RICEZIONE (RXQ)
  * =========================================================================
  *
- * MAX_PKT_NUM: slot nel ring buffer ciclico della RXQ.
+ * MAX_PKT_NUM: slot nel ring buffer della rxq.
  *   La BF2 DMA i pacchetti in questo buffer circolare in GPU memory.
  *   16384 slot × MAX_PKT_SIZE byte = 32 MB per porta.
  *
  * MAX_PKT_SIZE: dimensione massima per pacchetto, in byte.
- *   2048 è sufficiente per Ethernet standard (MTU 1500 + header 14B + padding).
+ *   2048 per Ethernet standard (MTU 1500 + header 14B + padding).
  *
- * MAX_RX_TIMEOUT_NS: quanto aspetta la recv del kernel prima di tornare a mani
- *   vuote. 500 µs è un buon compromesso: risposta rapida al SIGINT ma non così
- *   breve da sprecare cicli GPU in loop vuoti.
+ * MAX_RX_TIMEOUT_NS: quanto aspetta la recv del cuda kernel prima di tornare a mani
+ *   vuote. 500 µs è un buon compromesso percgè se arriva Ctrl+C  non devo aspettare troppo
+ *   prima di uscire effettivamente dal programma e anche senza sprecare cicli GPU in loop vuoti
+ *   perchè se fosse troppo breve potrei ritornare più spesso senza pacchetti.
  *
  * MAX_RX_NUM_PKTS: quanti pacchetti può restituire una singola recv call.
  *   Con EXEC_SCOPE_BLOCK e 32 thread, ogni thread processa fino a
@@ -50,7 +50,7 @@
  */
 #define MAX_PKT_NUM       16384
 #define MAX_PKT_SIZE      2048
-#define MAX_RX_TIMEOUT_NS 500000      /* 500 microsecondi */
+#define MAX_RX_TIMEOUT_NS 500000    
 #define MAX_RX_NUM_PKTS   2048
 
 /* =========================================================================
@@ -59,7 +59,7 @@
  *
  * MAX_SQ_DESCR_NUM: numero di Work Queue Entry (WQE) nel Send Queue della TXQ.
  *   Ogni WQE = istruzione per la NIC "invia questi N byte da questo indirizzo".
- *   1024 WQE è abbondante per i burst tipici (max MAX_RX_NUM_PKTS = 2048,
+ *   1024 WQE è abbondante per i burst tipici (ma MAX_RX_NUM_PKTS = 2048,
  *   ma i WQE si consumano in ordine e la NIC li processa velocemente).
  */
 #define MAX_SQ_DESCR_NUM  1024
@@ -73,7 +73,7 @@
 #define FLOW_NB_COUNTERS  512
 
 /* =========================================================================
- * COSTANTI — KERNEL CUDA
+ * COSTANTI — CUDA KERNEL
  * =========================================================================
  *
  * BRIDGE_BLOCK_THREADS: thread nel blocco CUDA del kernel bridge.
@@ -82,8 +82,7 @@
  *   Perché 32? EXEC_SCOPE_BLOCK con 32 thread = 1 warp intero.
  *   La chiamata doca_gpu_dev_eth_rxq_recv<BLOCK> usa TUTTI i 32 thread
  *   cooperativamente per ricevere il batch. Con esattamente 1 warp,
- *   la sincronizzazione è garantita dall'hardware (warp execution) senza
- *   overhead di __syncthreads sul percorso critico della recv.
+ *   la sincronizzazione è garantita dall'hardware (warp execution)
  */
 #define BRIDGE_BLOCK_THREADS 32
 
@@ -93,13 +92,16 @@
  *
  * MAC_TABLE_SIZE: numero di slot nella hash table.
  *   Deve essere potenza di 2: usiamo (h & (SIZE-1)) invece di (h % SIZE),
- *   che è molto più veloce sulla GPU (AND vs divisione).
+ *   che è molto più veloce sulla GPU (AND vs divisione)
  *   4096 = 4K entry: sufficiente per una LAN tipica.
  *
- * MAC_TABLE_PROBE_MAX: max probe steps nel linear probing prima di rinunciare.
+ * MAC_TABLE_PROBE_MAX: se lo slot calcolato è già occupato da un MAC diverso, prova lo slot successivo (slot + 1)
+ *   poi il successivo ancora, finché non trova o lo stesso MAC (aggiorna) o uno slot vuoto (lo inserisce lì)
+ *   quindi max probe steps nel linear probing prima di rinunciare.
  *   256 significa che esploriamo fino a 256 slot consecutivi prima di dichiarare
- *   la tabella "piena" per quel bucket. Nella pratica con 4K slot e buona
- *   distribuzione hash, la collision chain è raramente > 4-5.
+ *   la tabella "piena" per quel bucket
+ *   di conseguenza il lookup tornerà -1 come se il MAC non sia stato trovato quindi farà flooding,
+ *   il mac_learn che è l'inserimento del mac nella tabella fallisce in maniera silenziosa
  *
  * MAC_ENTRY_VALID_BIT: bit 63 di un'entry uint64_t = slot occupato.
  *   Questo permette di distinguere slot vuoto (entry==0) da un entry per
@@ -138,7 +140,7 @@
  * ┌─────────────────────────────────────────────────────────────────────┐
  * │  FLUSSO DEI DATI PER UNA PORTA (es. porta 0)                        │
  * │                                                                      │
- * │  [Rete] ──DMA_write──> [rxq_buf in GPU memory A30X]                  │
+ * │  [Rete] ──DMA_write──> [rxq_buf in GPU memory ]                      │
  * │                               │                                      │
  * │                        kernel CUDA legge                             │
  * │                               │                                      │
@@ -160,11 +162,15 @@ struct bridge_port {
      *
      * La NIC BF2 riceve pacchetti dalla rete e li scrive DIRETTAMENTE
      * nella GPU memory (rxq_buf) tramite DMA peer-to-peer (gdrcopy/dmabuf).
-     * Nessun coinvolgimento della CPU: la NIC parla direttamente con la A30X.
+     * Nessun coinvolgimento della CPU: la NIC parla direttamente con la A30.
      *
+     * rxq_ctx:  vista generica "doca_ctx" di rxq_cpu (doca_eth_rxq_as_doca_ctx).
+     *   Serve per le API comuni a tutte le librerie DOCA: assegnare il data
+     *   path alla GPU (doca_ctx_set_datapath_on_gpu) e avviare/fermare la
+     *   coda presso la NIC (doca_ctx_start / doca_ctx_stop).
      * rxq_cpu:  handle usato durante il setup (da questo file .c)
      * rxq_gpu:  handle passato al kernel CUDA (puntatore a struttura in GPU)
-     * rxq_mmap: descrive rxq_buf alla NIC tramite RDMA registration
+     * rxq_mmap: descrive rxq_buf alla NIC tramite RDMA registration altrimenti non potrebbe farci DMA
      * rxq_buf:  il buffer ciclico in GPU memory dove arrivano i pacchetti
      * rxq_dmabuf_fd: file descriptor per DMABuf (se supportato dal kernel)
      *
@@ -173,7 +179,7 @@ struct bridge_port {
      *   (non usato nel bridge normale, ma disponibile per loopback/debug).
      *
      * rxq_mkey_for_other_txq: mkey per la NIC dell'ALTRA porta.
-     *   Questo è il mkey CRUCIALE per il forwarding cross-port zero-copy:
+     *   Questo è il mkey per il forwarding cross-port zero-copy:
      *   la TXQ dell'altra porta usa questo mkey per leggere da rxq_buf
      *   di questa porta.
      *
@@ -191,7 +197,6 @@ struct bridge_port {
     struct doca_mmap        *rxq_mmap;
     void                    *rxq_buf;
     int                      rxq_dmabuf_fd;
-    size_t                   rxq_buf_size;      /* dimensione allocata (per cleanup) */
     uint32_t                 rxq_mkey_for_own_txq;    /* mkey per questa NIC */
     uint32_t                 rxq_mkey_for_other_txq;  /* mkey per l'altra NIC */
 
@@ -224,7 +229,7 @@ struct bridge_port {
      *
      * Usiamo una singola BASIC ROOT pipe con match template = {0} (tutti
      * i campi a zero = wildcard su qualsiasi campo) e una sola entry che
-     * cattura qualsiasi pacchetto e lo manda alla RSS queue 0 (la GPU RXQ).
+     * cattura qualsiasi pacchetto e lo manda alla queue 0 (la GPU RXQ).
      *
      * flow_port:  handle DOCA Flow per questa porta (ID univoco 0 o 1)
      * root_pipe:  la BASIC ROOT pipe con match wildcard
