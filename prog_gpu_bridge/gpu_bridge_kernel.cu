@@ -14,7 +14,7 @@
  *   Per ogni porta sorgente, il processing ha tre fasi:
  *
  *     Fase 1 — inizializzazione contatori batch (solo thread 0):
- *       Reset next_wqe_slot[q] e last_wqe_pkt_*[q] per ogni TXQ.
+ *       Reset next_wqe_slot[q] e last_wqe_key[q] per ogni TXQ.
  *
  *     Fase 2 — parallela (tutti i 32 thread contemporaneamente):
  *       Ogni thread gestisce i propri pacchetti (t, t+32, t+64, ...):
@@ -23,7 +23,7 @@
  *         3. Calcola egress_mask (bitmask porte di uscita)
  *         4. Per ogni bit q in egress_mask:
  *            a. atomicAdd su next_wqe_slot[q] → ottiene slot consecutivo
- *            b. Aggiorna last_wqe_pkt_*[q] (per il fixup NOTIFY)
+ *            b. atomicMax su last_wqe_key[q] (per il fixup NOTIFY)
  *            c. Riempie WQE su txq[q] senza NOTIFY
  *
  *     Fase 3 — seriale (solo thread 0):
@@ -40,15 +40,18 @@
  *   già inviati (al contrario di un buffer lineare dove servirebbe
  *   un offset globale). L'unico vincolo è NOTIFY sul LAST WQE del batch.
  *
- * PROPRIETÀ "LAST WRITE WINS" IN UN SINGOLO WARP:
- *   Con 32 thread = 1 warp (lockstep hardware NVIDIA), le atomicAdd su
- *   next_wqe_slot[q] sono serializzate in lane-order (thread 0, 1, ..., 31).
- *   Il thread con lo slot più alto per TXQ q è anche l'ULTIMO ad aggiornare
- *   last_wqe_pkt_*[q] in quella iterazione del while loop.
- *   Poiché le iterazioni del while loop sono sequenziali (lockstep),
- *   dopo il while loop last_wqe_pkt_*[q] contiene i dati dell'ultimo WQE
- *   (quello con l'indice più alto = quello che thread 0 deve ri-riempire
- *   con NOTIFY). Questa proprietà è valida SOLO per un singolo warp.
+ * IDENTIFICAZIONE DELL'ULTIMO WQE (last_wqe_key, atomico):
+ *   Ogni thread impacchetta (slot << 32) | pkt_idx e lo confronta con
+ *   atomicMax su last_wqe_key[q]. Poiché slot occupa i bit alti del valore
+ *   a 64 bit, il massimo risultante identifica per costruzione lo slot piu'
+ *   alto assegnato a TXQ q, insieme al pkt_idx che lo ha generato.
+ *   atomicMax e' una vera operazione atomica sull'intera word: non richiede
+ *   alcuna assunzione sull'ordine di esecuzione dei thread nel warp (a
+ *   differenza di una scrittura non-atomica "last write wins", che sarebbe
+ *   una gara tra thread — undefined behavior anche in lockstep puro, e in
+ *   ogni caso non garantita dal modello CUDA a partire da Volta/Independent
+ *   Thread Scheduling). Thread 0, in Fase 3, decodifica pkt_idx e recupera
+ *   addr/bytes/mkey del pacchetto vincente per il fixup NOTIFY.
  *
  * FLOODING A N PORTE:
  *   egress_mask = ((1u << n_ports) - 1u) & ~(1u << src)
@@ -120,8 +123,23 @@ static __device__ __forceinline__ uint32_t mac_hash(uint64_t mac48)
  *   MAC diverso:     linear probe al prossimo slot
  *   tabella piena:   rinuncia silenziosamente (flood come fallback)
  */
-static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int src_port)
+/*
+ * mac_learn: come sopra, ma registra anche i "flap" — un MAC già presente
+ * che viene re-imparato su una porta DIVERSA da quella registrata.
+ * In una topologia senza loop fisico un host non cambia mai porta: flap
+ * frequenti sono il sintomo classico di un loop L2 reale nella rete.
+ * flap_ring_head è un contatore atomico monotono: il suo valore intero è
+ * anche il totale dei flap avvenuti (usato dalla CPU per il report live).
+ */
+static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int src_port,
+                                  struct mac_flap_record *flap_ring,
+                                  uint32_t *flap_ring_head)
 {
+    /* Non imparare sorgenti multicast/broadcast (bit I/G del primo ottetto):
+     * uno switch reale scarta questi frame per evitare di avvelenare la FIB. */
+    if (mac48 & ((uint64_t)1 << 40))
+        return;
+
     uint64_t nuova_entry = MAC_ENTRY_VALID_BIT |
                            ((uint64_t)(src_port & 0xFF) << MAC_ENTRY_PORT_SHIFT) |
                            (mac48 & MAC_48BIT_MASK);
@@ -140,6 +158,17 @@ static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int src_po
         }
 
         if ((val & MAC_48BIT_MASK) == (mac48 & MAC_48BIT_MASK)) {
+            int old_port = (int)((val & MAC_ENTRY_PORT_MASK) >> MAC_ENTRY_PORT_SHIFT);
+
+            if (old_port != src_port) {
+                uint32_t idx = atomicAdd(flap_ring_head, 1u);
+                struct mac_flap_record *rec = &flap_ring[idx % FLAP_RING_SIZE];
+                rec->mac48    = mac48;
+                rec->old_port = (uint32_t)old_port;
+                rec->new_port = (uint32_t)src_port;
+                rec->seq      = idx;
+            }
+
             atomicExch((unsigned long long *)&mac_table[slot],
                        (unsigned long long)nuova_entry);
             return;
@@ -147,6 +176,20 @@ static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int src_po
 
         slot = (slot + 1) & (MAC_TABLE_SIZE - 1);
     }
+}
+
+/*
+ * is_8021d_reserved: riconosce il blocco di multicast riservato IEEE 802.1D
+ * 01:80:C2:00:00:00 – 01:80:C2:00:00:0F (STP BPDU, LLDP, e altri protocolli
+ * "link-local"). Per definizione dello standard questi frame non vanno MAI
+ * inoltrati da un bridge/switch conforme: restano sempre a un solo hop,
+ * consumati localmente da chi li riceve. Il nostro bridge non ha un
+ * "consumer" per questi protocolli, quindi il comportamento corretto è
+ * semplicemente droppare (mai floodare/forwardare).
+ */
+static __device__ __forceinline__ bool is_8021d_reserved(uint64_t mac48)
+{
+    return (mac48 & 0xFFFFFFFFFFF0ULL) == 0x0180C2000000ULL;
 }
 
 /*
@@ -196,11 +239,11 @@ static __device__ int mac_lookup(const uint64_t *mac_table, uint64_t mac48)
  *     Ogni thread fa atomicAdd per ottenere il proprio slot consecutivo.
  *     Azzerato all'inizio di ogni batch (per ogni porta src).
  *
- *   last_wqe_pkt_addr/bytes/mkey[MAX_N_PORTS]:
- *     Info dell'ultimo WQE scritto per ogni TXQ.
- *     Thread 0 le usa dopo __syncthreads() per ri-riempire l'ultimo
+ *   last_wqe_key[MAX_N_PORTS]:
+ *     (slot << 32) | pkt_idx dell'ultimo WQE scritto per ogni TXQ,
+ *     risolto con atomicMax (vedi header per i dettagli).
+ *     Thread 0 lo usa dopo __syncthreads() per ri-riempire l'ultimo
  *     WQE con flag NOTIFY (fixup prima del submit).
- *     "Last write wins" è garantito nel singolo warp (vedi header).
  *
  * VARIABILI PRIVATE DI THREAD 0 (solo usate in Fase 3):
  *   wqe_base[MAX_N_PORTS]: prossimo indice WQE per ogni TXQ (persistente tra batch)
@@ -222,14 +265,29 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
     __shared__ uint32_t next_wqe_slot[MAX_N_PORTS];
 
     /*
-     * Info dell'ultimo WQE per ogni TXQ (vedi commento nel file header).
-     * Aggiornate con semplici scritture (no atomic): la proprietà di lockstep
-     * del singolo warp garantisce che l'ultima scrittura corrisponda all'ultimo
-     * WQE (quello con l'indice più alto nel ring).
+     * last_wqe_key[q]: identifica il WQE con slot più alto per TXQ q.
+     * Impacchetta (slot << 32) | pkt_idx in un uint64_t e viene aggiornato
+     * con atomicMax: poiché slot occupa i bit alti, il valore massimo
+     * corrisponde per costruzione allo slot più alto, indipendentemente
+     * dall'ordine di esecuzione dei thread nel warp. A differenza di una
+     * scrittura non-atomica "last write wins", atomicMax è una vera
+     * operazione atomica: nessuna assunzione di lockstep richiesta, quindi
+     * corretto anche con Independent Thread Scheduling (Volta+).
      */
-    __shared__ uint64_t last_wqe_pkt_addr[MAX_N_PORTS];
-    __shared__ uint32_t last_wqe_pkt_bytes[MAX_N_PORTS];
-    __shared__ uint32_t last_wqe_pkt_mkey[MAX_N_PORTS];
+    __shared__ uint64_t last_wqe_key[MAX_N_PORTS];
+
+    /*
+     * batch_flood/unicast/drop: contatori diagnostici per il batch corrente.
+     * Azzerati in Fase 2A, incrementati con atomicAdd da tutti i thread in
+     * Fase 2B in base alla classificazione del pacchetto, consolidati nei
+     * contatori persistenti (flood_total/unicast_total/drop_total) da
+     * thread 0 dopo il batch. Servono a capire — senza accesso allo switch —
+     * se un numero di forward "sproporzionato" viene da pacchetti REALMENTE
+     * ricevuti (rx_pkt_total) e quanti sono flood vs unicast.
+     */
+    __shared__ uint32_t batch_flood;
+    __shared__ uint32_t batch_unicast;
+    __shared__ uint32_t batch_drop;
 
     /*
      * wqe_base[q]: indice assoluto del prossimo WQE da scrivere per TXQ q.
@@ -244,6 +302,11 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
     /* cqe_idx e tot_fwd: acceduti solo da thread 0, possono stare in locale */
     uint64_t cqe_idx[MAX_N_PORTS];
     uint64_t tot_fwd = 0;
+
+    /* Contatori diagnostici persistenti (solo thread 0, come tot_fwd) */
+    uint64_t rx_pkt_total_local[MAX_N_PORTS];
+    uint64_t flood_total = 0, unicast_total = 0, drop_total = 0;
+
     doca_error_t ret;
 
     if (threadIdx.x == 0) {
@@ -251,6 +314,8 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
             wqe_base[q] = 0;
             cqe_idx[q]  = 0;
         }
+        for (int q = 0; q < MAX_N_PORTS; q++)
+            rx_pkt_total_local[q] = 0;
     }
     __syncthreads();
 
@@ -295,11 +360,13 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
              * ============================================================== */
             if (threadIdx.x == 0) {
                 for (int q = 0; q < kp.n_ports; q++) {
-                    next_wqe_slot[q]      = 0;
-                    last_wqe_pkt_addr[q]  = 0;
-                    last_wqe_pkt_bytes[q] = 0;
-                    last_wqe_pkt_mkey[q]  = 0;
+                    next_wqe_slot[q]  = 0;
+                    last_wqe_key[q]   = 0;
                 }
+                batch_flood   = 0;
+                batch_unicast = 0;
+                batch_drop    = 0;
+                rx_pkt_total_local[src] += rx_pkt_count;
             }
             __syncthreads();
 
@@ -318,7 +385,7 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
              *      - unicast:              solo bit dst_port
              *   4. Per ogni bit q in egress_mask:
              *      - atomicAdd → slot consecutivo su txq[q]
-             *      - aggiorna last_wqe_pkt_*[q] (last write wins in warp)
+             *      - atomicMax su last_wqe_key[q] (identifica lo slot max)
              *      - riempi WQE senza NOTIFY
              * ============================================================== */
             uint32_t pkt_idx = threadIdx.x;
@@ -332,14 +399,14 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                 uint64_t src_mac48 = mac_to_u64(eth + 6);   /* byte 6-11 */
 
                 /* Backward learning: il mittente è raggiungibile su 'src' */
-                mac_learn(kp.mac_table, src_mac48, src);
-
-                /* FIB lookup: verso quale porta mandare dst_mac? */
-                int dst_port = mac_lookup(kp.mac_table, dst_mac48);
+                mac_learn(kp.mac_table, src_mac48, src, kp.flap_ring, kp.flap_ring_head);
 
                 /*
                  * Calcolo egress_mask (uint32_t, bit q = "invia a porta q"):
                  *
+                 *   dst 802.1D riservato → drop SEMPRE: STP/LLDP/altri protocolli
+                 *                      "link-local" non vanno mai inoltrati da
+                 *                      un bridge conforme (vedi is_8021d_reserved).
                  *   dst_port == src  → drop: il destinatario è sulla porta
                  *                      di ingresso (loop potenziale)
                  *   dst_port == -1   → flood: manda a tutte le porte tranne src
@@ -350,12 +417,23 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                  * Con N>2 porte: flood invia a N-1 TXQ, unicast a 1 sola.
                  */
                 uint32_t egress_mask;
-                if (dst_port == src) {
+                if (is_8021d_reserved(dst_mac48)) {
                     egress_mask = 0u;
-                } else if (dst_port < 0) {
-                    egress_mask = ((1u << kp.n_ports) - 1u) & ~(1u << src);
+                    atomicAdd(&batch_drop, 1u);
                 } else {
-                    egress_mask = (1u << dst_port);
+                    /* FIB lookup: verso quale porta mandare dst_mac? */
+                    int dst_port = mac_lookup(kp.mac_table, dst_mac48);
+
+                    if (dst_port == src) {
+                        egress_mask = 0u;
+                        atomicAdd(&batch_drop, 1u);
+                    } else if (dst_port < 0) {
+                        egress_mask = ((1u << kp.n_ports) - 1u) & ~(1u << src);
+                        atomicAdd(&batch_flood, 1u);
+                    } else {
+                        egress_mask = (1u << dst_port);
+                        atomicAdd(&batch_unicast, 1u);
+                    }
                 }
 
                 /*
@@ -368,12 +446,11 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                  *   Non serve prefix sum: il ring è circolare, non c'è
                  *   bisogno di sapere quanti WQE ci sono stati prima.
                  *
-                 * last_wqe_pkt_*[q]:
-                 *   Scrittura semplice (no atomic). Nel lockstep del warp,
-                 *   l'ultimo thread a scrivere per TXQ q ha anche lo slot
-                 *   più alto (perché l'atomicAdd assegna slot in lane-order
-                 *   e la scrittura segue immediatamente l'atomicAdd nella
-                 *   stessa "istruzione lockstep"). Vedere commento nel header.
+                 * last_wqe_key[q]:
+                 *   atomicMax su (slot << 32) | pkt_idx. Vera operazione
+                 *   atomica: lo slot più alto vince per costruzione del
+                 *   confronto numerico, senza alcuna assunzione sull'ordine
+                 *   di esecuzione dei thread nel warp.
                  *
                  * WQE zero-copy cross-port:
                  *   Il WQE punta a pkt_addr nel buffer GPU della porta src.
@@ -387,10 +464,9 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                     uint32_t mkey = kp.rxq_mkey_cross[src][q];
                     uint32_t slot = atomicAdd(&next_wqe_slot[q], 1u);
 
-                    /* Last write wins: il thread con slot più alto scrive ultimo */
-                    last_wqe_pkt_addr[q]  = pkt_addr;
-                    last_wqe_pkt_bytes[q] = rx_attr[pkt_idx].bytes;
-                    last_wqe_pkt_mkey[q]  = mkey;
+                    uint64_t key = ((uint64_t)slot << 32) | (uint64_t)pkt_idx;
+                    atomicMax((unsigned long long *)&last_wqe_key[q],
+                              (unsigned long long)key);
 
                     struct doca_gpu_dev_eth_txq_wqe *wqe =
                         doca_gpu_dev_eth_txq_get_wqe_ptr(
@@ -431,17 +507,24 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
 
                     /*
                      * Fixup: ri-riempie l'ultimo WQE (slot più alto) con NOTIFY.
-                     * last_wqe_pkt_*[q] contiene i dati del WQE con slot n-1
-                     * (garantito dalla proprietà "last write wins" nel warp).
+                     * Decodifica pkt_idx dalla chiave (slot << 32 | pkt_idx)
+                     * risolta atomicamente da atomicMax: identifica senza
+                     * ambiguità il pacchetto che ha ottenuto lo slot n-1.
                      */
+                    uint32_t last_pkt_idx = (uint32_t)(last_wqe_key[q] & 0xFFFFFFFFu);
+                    uint64_t last_pkt_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
+                        kp.rxq_gpu[src], rx_first_pkt_idx + last_pkt_idx);
+                    uint32_t last_pkt_bytes = rx_attr[last_pkt_idx].bytes;
+                    uint32_t last_pkt_mkey  = kp.rxq_mkey_cross[src][q];
+
                     uint64_t last_slot = wqe_base[q] + n - 1;
                     struct doca_gpu_dev_eth_txq_wqe *last_wqe =
                         doca_gpu_dev_eth_txq_get_wqe_ptr(kp.txq_gpu[q], last_slot);
                     doca_gpu_dev_eth_txq_wqe_prepare_send(
                         kp.txq_gpu[q], last_wqe, last_slot,
-                        last_wqe_pkt_addr[q],
-                        last_wqe_pkt_mkey[q],
-                        last_wqe_pkt_bytes[q],
+                        last_pkt_addr,
+                        last_pkt_mkey,
+                        last_pkt_bytes,
                         DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY);
 
                     /* Doorbell: dice alla NIC q "ci sono n WQE da processare" */
@@ -463,21 +546,49 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                     cqe_idx[q]  += 1;
                     tot_fwd     += n;
                 }
+
+                /* Consolida i contatori diagnostici del batch nei totali persistenti. */
+                flood_total   += batch_flood;
+                unicast_total += batch_unicast;
+                drop_total    += batch_drop;
             }
             __syncthreads();
 
         } /* for src */
 
+        /*
+         * Pubblica i contatori diagnostici verso la CPU una volta per ogni
+         * giro completo su tutte le porte (non ad ogni singolo batch, per
+         * non aggiungere una PCIe write nel path caldo). __threadfence_system()
+         * rende visibili alla CPU tutte le scritture GPU precedenti, incluse
+         * quelle di mac_learn() sul flap_ring fatte da tutti i thread (già
+         * ordinate rispetto a questo punto dai vari __syncthreads() sopra).
+         */
+        if (threadIdx.x == 0) {
+            for (int q = 0; q < kp.n_ports; q++)
+                kp.rx_pkt_total[q] = rx_pkt_total_local[q];
+            *kp.flood_count   = flood_total;
+            *kp.unicast_count = unicast_total;
+            *kp.drop_count    = drop_total;
+            *kp.fwd_count     = tot_fwd;
+            __threadfence_system();
+        }
+        __syncthreads();
+
     } /* while (!exit_cond) */
 
     /*
-     * Pubblica il contatore verso la CPU.
-     * __threadfence_system(): flush cache GPU attraverso PCIe.
-     * Necessario perché fwd_count è in CPU_GPU memory (pinned sul lato CPU);
-     * senza questo la CPU potrebbe leggere un valore stale dalla propria cache.
+     * Pubblica un'ultima volta verso la CPU (ridondante rispetto al flush
+     * di fine giro sopra, ma garantisce che l'ultimo batch prima di
+     * exit_cond sia sempre riflesso nel report finale).
      */
     if (threadIdx.x == 0) {
-        *kp.fwd_count = tot_fwd;
+        for (int q = 0; q < kp.n_ports; q++)
+            kp.rx_pkt_total[q] = rx_pkt_total_local[q];
+        *kp.flood_count   = flood_total;
+        *kp.unicast_count = unicast_total;
+        *kp.drop_count    = drop_total;
+        *kp.fwd_count     = tot_fwd;
         __threadfence_system();
     }
 }
@@ -497,6 +608,10 @@ doca_error_t kernel_launch_bridge(cudaStream_t stream,
     cudaError_t cuda_ret;
 
     if (!kp || !kp->mac_table || !kp->exit_cond || !kp->fwd_count)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    if (!kp->rx_pkt_total || !kp->flood_count || !kp->unicast_count ||
+        !kp->drop_count || !kp->flap_ring || !kp->flap_ring_head)
         return DOCA_ERROR_INVALID_VALUE;
 
     if (kp->n_ports < 2 || kp->n_ports > MAX_N_PORTS)

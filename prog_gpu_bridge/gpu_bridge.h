@@ -90,9 +90,10 @@
  *
  * BRIDGE_BLOCK_THREADS = 32 = 1 warp NVIDIA.
  * Richiesto da EXEC_SCOPE_BLOCK: tutti i thread cooperano per la recv.
- * Con esattamente 1 warp, la sincronizzazione intra-warp è gratuita (lockstep).
- * Avere 1 solo warp garantisce la proprietà di lockstep usata per il
- * tracking del "last WQE" (vedi gpu_bridge_kernel.cu).
+ * Il tracking del "last WQE" per il fixup NOTIFY (vedi gpu_bridge_kernel.cu)
+ * usa atomicMax su una chiave (slot, pkt_idx) e non richiede alcuna
+ * assunzione di lockstep, quindi è corretto anche su architetture con
+ * Independent Thread Scheduling (Volta+).
  */
 #define BRIDGE_BLOCK_THREADS 32
 
@@ -118,6 +119,29 @@
 #define MAC_ENTRY_PORT_SHIFT 48
 #define MAC_ENTRY_PORT_MASK  0x00FF000000000000ULL  /* bit 48-55: porta (0-255) */
 #define MAC_48BIT_MASK       0x0000FFFFFFFFFFFFULL  /* bit 0-47:  MAC address */
+
+/* =========================================================================
+ * DIAGNOSTICA — MAC FLAP DETECTION
+ * =========================================================================
+ * Un "flap" e' quando un MAC gia' presente nella FIB viene re-imparato
+ * su una porta DIVERSA da quella registrata. In una topologia senza loop
+ * fisico questo non dovrebbe mai succedere (un host sta sempre dietro
+ * la stessa porta). Flap frequenti sono la prova classica di un loop L2
+ * reale nella rete (il frame torna indietro e viene re-imparato al contrario).
+ *
+ * flap_ring_head e' un contatore atomico monotono: il suo valore intero
+ * E' il totale dei flap avvenuti; (head % FLAP_RING_SIZE) e' lo slot dove
+ * viene scritto il record più recente (ring buffer, i piu' vecchi vengono
+ * sovrascritti).
+ */
+#define FLAP_RING_SIZE 64
+
+struct mac_flap_record {
+    uint64_t mac48;
+    uint32_t old_port;
+    uint32_t new_port;
+    uint64_t seq;
+};
 
 /* =========================================================================
  * MACRO — ALLINEAMENTO MEMORIA
@@ -186,6 +210,15 @@ struct bridge_kernel_params {
     uint64_t *mac_table;
     uint32_t *exit_cond;
     uint64_t *fwd_count;
+
+    /* ── Diagnostica live (CPU_GPU, pubblicata una volta per ogni giro
+     * completo su tutte le porte, con __threadfence_system) ──────────── */
+    uint64_t *rx_pkt_total;   /* [n_ports]: pacchetti ricevuti realmente da RXQ */
+    uint64_t *flood_count;    /* pacchetti floodati (dst MAC sconosciuto) */
+    uint64_t *unicast_count;  /* pacchetti forwardati per unicast lookup */
+    uint64_t *drop_count;     /* pacchetti droppati (dst sulla stessa porta src) */
+    struct mac_flap_record *flap_ring;  /* [FLAP_RING_SIZE] */
+    uint32_t *flap_ring_head;           /* contatore monotono totale flap */
 };
 
 /* =========================================================================

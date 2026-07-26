@@ -61,6 +61,18 @@ static size_t system_page_size(void)
     return (ret <= 0) ? 4096UL : (size_t)ret;
 }
 
+/* Formatta un mac48 (bit 0-47, byte 0 nei bit alti — vedi mac_to_u64 nel
+ * kernel) come stringa "aa:bb:cc:dd:ee:ff" in un buffer statico. */
+static const char *mac48_to_str(uint64_t mac48)
+{
+    static char buf[18];
+    snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
+             (unsigned)((mac48 >> 40) & 0xFF), (unsigned)((mac48 >> 32) & 0xFF),
+             (unsigned)((mac48 >> 24) & 0xFF), (unsigned)((mac48 >> 16) & 0xFF),
+             (unsigned)((mac48 >>  8) & 0xFF), (unsigned)( mac48        & 0xFF));
+    return buf;
+}
+
 /* ==========================================================================
  * APERTURA DEVICE NIC
  * ==========================================================================
@@ -572,6 +584,12 @@ static void cleanup_all(struct bridge_port *ports,
                          uint64_t           *mac_table_gpu,
                          uint32_t           *gpu_exit,
                          uint64_t           *gpu_fwd,
+                         uint64_t           *gpu_rx_total,
+                         uint64_t           *gpu_flood,
+                         uint64_t           *gpu_unicast,
+                         uint64_t           *gpu_drop,
+                         struct mac_flap_record *gpu_flap_ring,
+                         uint32_t           *gpu_flap_head,
                          cudaStream_t        stream,
                          bool                flow_initialized)
 {
@@ -581,6 +599,14 @@ static void cleanup_all(struct bridge_port *ports,
     /* Libera variabili di sincronizzazione GPU */
     if (gpu_exit && gdev) doca_gpu_mem_free(gdev, gpu_exit);
     if (gpu_fwd  && gdev) doca_gpu_mem_free(gdev, gpu_fwd);
+
+    /* Libera contatori diagnostici (flap detection, flood/unicast/drop) */
+    if (gpu_rx_total && gdev) doca_gpu_mem_free(gdev, gpu_rx_total);
+    if (gpu_flood    && gdev) doca_gpu_mem_free(gdev, gpu_flood);
+    if (gpu_unicast  && gdev) doca_gpu_mem_free(gdev, gpu_unicast);
+    if (gpu_drop     && gdev) doca_gpu_mem_free(gdev, gpu_drop);
+    if (gpu_flap_ring && gdev) doca_gpu_mem_free(gdev, gpu_flap_ring);
+    if (gpu_flap_head && gdev) doca_gpu_mem_free(gdev, gpu_flap_head);
 
     for (int p = 0; p < n_ports; p++) {
         if (ports[p].root_pipe) doca_flow_pipe_destroy(ports[p].root_pipe);
@@ -671,6 +697,18 @@ int main(int argc, char *argv[])
     uint32_t             *cpu_exit     = NULL;
     uint64_t             *gpu_fwd      = NULL;
     uint64_t             *cpu_fwd      = NULL;
+    uint64_t             *gpu_rx_total = NULL;
+    uint64_t             *cpu_rx_total = NULL;
+    uint64_t             *gpu_flood    = NULL;
+    uint64_t             *cpu_flood    = NULL;
+    uint64_t             *gpu_unicast  = NULL;
+    uint64_t             *cpu_unicast  = NULL;
+    uint64_t             *gpu_drop     = NULL;
+    uint64_t             *cpu_drop     = NULL;
+    struct mac_flap_record *gpu_flap_ring = NULL;
+    struct mac_flap_record *cpu_flap_ring = NULL;
+    uint32_t             *gpu_flap_head = NULL;
+    uint32_t             *cpu_flap_head = NULL;
     cudaStream_t          stream       = NULL;
     bool                  flow_inited  = false;
     struct bridge_kernel_params kp     = {0};
@@ -774,6 +812,69 @@ int main(int argc, char *argv[])
     }
     *cpu_fwd = 0;
 
+    /* ── 10b. Alloca contatori diagnostici (CPU_GPU) ──────────────────────
+     * rx_pkt_total[n_ports]: pacchetti REALMENTE ricevuti dalla RXQ, per
+     * confrontarli con fwd_count — se fwd_count supera quello che è stato
+     * ricevuto, è un bug SW (fantasmi); se combaciano, il traffico è reale
+     * (loop di rete o flooding legittimo per FIB non convergente).
+     * flood/unicast/drop: come viene classificato ogni pacchetto ricevuto.
+     * flap_ring + flap_ring_head: vedi gpu_bridge.h — rilevano un MAC che
+     * cambia porta, sintomo classico di un loop L2 fisico.
+     */
+    res = doca_gpu_mem_alloc(gdev, (size_t)n_ports * sizeof(uint64_t),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_rx_total, (void **)&cpu_rx_total);
+    if (res != DOCA_SUCCESS || !gpu_rx_total) {
+        fprintf(stderr, "alloc rx_pkt_total: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_rx_total, 0, (size_t)n_ports * sizeof(uint64_t));
+
+    res = doca_gpu_mem_alloc(gdev, sizeof(uint64_t), system_page_size(),
+                              DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_flood, (void **)&cpu_flood);
+    if (res != DOCA_SUCCESS || !gpu_flood) {
+        fprintf(stderr, "alloc flood_count: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    *cpu_flood = 0;
+
+    res = doca_gpu_mem_alloc(gdev, sizeof(uint64_t), system_page_size(),
+                              DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_unicast, (void **)&cpu_unicast);
+    if (res != DOCA_SUCCESS || !gpu_unicast) {
+        fprintf(stderr, "alloc unicast_count: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    *cpu_unicast = 0;
+
+    res = doca_gpu_mem_alloc(gdev, sizeof(uint64_t), system_page_size(),
+                              DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_drop, (void **)&cpu_drop);
+    if (res != DOCA_SUCCESS || !gpu_drop) {
+        fprintf(stderr, "alloc drop_count: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    *cpu_drop = 0;
+
+    res = doca_gpu_mem_alloc(gdev, (size_t)FLAP_RING_SIZE * sizeof(struct mac_flap_record),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_flap_ring, (void **)&cpu_flap_ring);
+    if (res != DOCA_SUCCESS || !gpu_flap_ring) {
+        fprintf(stderr, "alloc flap_ring: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_flap_ring, 0, (size_t)FLAP_RING_SIZE * sizeof(struct mac_flap_record));
+
+    res = doca_gpu_mem_alloc(gdev, sizeof(uint32_t), system_page_size(),
+                              DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_flap_head, (void **)&cpu_flap_head);
+    if (res != DOCA_SUCCESS || !gpu_flap_head) {
+        fprintf(stderr, "alloc flap_ring_head: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    *cpu_flap_head = 0;
+
     /* ── 11. CUDA stream ─────────────────────────────────────────────── */
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
         fprintf(stderr, "cudaStreamCreateWithFlags fallita\n");
@@ -789,6 +890,13 @@ int main(int argc, char *argv[])
     kp.mac_table = mac_table_gpu;
     kp.exit_cond = gpu_exit;
     kp.fwd_count = gpu_fwd;
+
+    kp.rx_pkt_total   = gpu_rx_total;
+    kp.flood_count    = gpu_flood;
+    kp.unicast_count  = gpu_unicast;
+    kp.drop_count     = gpu_drop;
+    kp.flap_ring      = gpu_flap_ring;
+    kp.flap_ring_head = gpu_flap_head;
 
     for (int p = 0; p < n_ports; p++) {
         kp.rxq_gpu[p] = ports[p].rxq_gpu;
@@ -815,20 +923,75 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    /* ── 14. Aspetta Ctrl+C ──────────────────────────────────────────── */
-    while (!DOCA_GPUNETIO_VOLATILE(g_force_quit))
-        ;
+    /* ── 14. Aspetta Ctrl+C, stampando statistiche live ────────────────
+     * I contatori sono pubblicati dal kernel una volta per ogni giro
+     * completo su tutte le porte (vedi gpu_bridge_kernel.cu), quindi qui
+     * possiamo leggerli direttamente senza cudaMemcpy/sync: sono in
+     * memoria CPU_GPU (primaria lato host), coerenti grazie al
+     * __threadfence_system() lato GPU.
+     *
+     * DIAGNOSTICA: rx_tot = pacchetti REALMENTE ricevuti dalla RXQ.
+     *   Se fwd > rx_tot(porta0)+rx_tot(porta1) è impossibile per costruzione
+     *   (con 2 porte al più 1 egress per pacchetto): sarebbe la prova di un
+     *   bug SW che "inventa" pacchetti. Se invece fwd cresce in proporzione
+     *   a rx_tot, i pacchetti stanno arrivando davvero dal cavo.
+     *   mac_flaps: un MAC che cambia porta ripetutamente è il sintomo
+     *   classico di un loop L2 fisico nella rete (non un bug software).
+     */
+    {
+        uint32_t last_flap_head = 0;
+        while (!DOCA_GPUNETIO_VOLATILE(g_force_quit)) {
+            usleep(500000);
+
+            uint64_t rx_sum = 0;
+            for (int p = 0; p < n_ports; p++)
+                rx_sum += cpu_rx_total[p];
+
+            printf("[live] rx_tot=%lu (", rx_sum);
+            for (int p = 0; p < n_ports; p++)
+                printf("porta%d=%lu%s", p, cpu_rx_total[p], p + 1 < n_ports ? " " : "");
+            printf(")  fwd=%lu  flood=%lu  unicast=%lu  drop=%lu  mac_flaps=%u\n",
+                   *cpu_fwd, *cpu_flood, *cpu_unicast, *cpu_drop, *cpu_flap_head);
+
+            uint32_t head = *cpu_flap_head;
+            uint32_t new_flaps = head - last_flap_head;
+            if (new_flaps > 0) {
+                uint32_t show = new_flaps > FLAP_RING_SIZE ? FLAP_RING_SIZE : new_flaps;
+                if (new_flaps > FLAP_RING_SIZE)
+                    printf("  (%u flap non mostrati, ring overflow)\n",
+                           new_flaps - FLAP_RING_SIZE);
+                for (uint32_t i = 0; i < show; i++) {
+                    uint32_t seq_want = head - show + i;
+                    struct mac_flap_record *r = &cpu_flap_ring[seq_want % FLAP_RING_SIZE];
+                    printf("  FLAP mac=%s  porta %u -> porta %u  (seq %lu)\n",
+                           mac48_to_str(r->mac48), r->old_port, r->new_port,
+                           (unsigned long)r->seq);
+                }
+                last_flap_head = head;
+            }
+
+            fflush(stdout);
+        }
+    }
 
     /* ── 15. Ferma il kernel ─────────────────────────────────────────── */
     DOCA_GPUNETIO_VOLATILE(*cpu_exit) = 1;
     cudaStreamSynchronize(stream);
 
     printf("\nFermato. Totale pacchetti forwardati: %lu\n", *cpu_fwd);
+    printf("  Ricevuti per porta: ");
+    for (int p = 0; p < n_ports; p++)
+        printf("porta%d=%lu ", p, cpu_rx_total[p]);
+    printf("\n  flood=%lu  unicast=%lu  drop=%lu  mac_flaps totali=%u\n",
+           *cpu_flood, *cpu_unicast, *cpu_drop, *cpu_flap_head);
 
 cleanup:
-    /* gpu_exit e gpu_fwd vengono liberati dentro cleanup_all */
+    /* gpu_exit, gpu_fwd e i contatori diagnostici vengono liberati dentro cleanup_all */
     cleanup_all(ports, n_ports, gdev, mac_table_gpu,
-                gpu_exit, gpu_fwd, stream, flow_inited);
+                gpu_exit, gpu_fwd,
+                gpu_rx_total, gpu_flood, gpu_unicast, gpu_drop,
+                gpu_flap_ring, gpu_flap_head,
+                stream, flow_inited);
     printf("Done.\n");
     return (res == DOCA_SUCCESS) ? 0 : 1;
 }
