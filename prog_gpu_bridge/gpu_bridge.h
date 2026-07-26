@@ -1,11 +1,18 @@
 /*
- * gpu_bridge.h — strutture, costanti e dichiarazioni per il GPU L2 Bridge.
+ * gpu_bridge.h — strutture, costanti e dichiarazioni per il GPU L2 Bridge a N porte.
  *
- * Il bridge collega due porte fisiche della BF2 (ad:00.0 e ad:00.1).
- * Ogni pacchetto che arriva su una porta viene processato dalla A30X:
- *   - backward learning: il src_mac viene associato ad una porta di ingresso
- *   - FIB lookup: il src_mac è noto, allora si cerca la porta di uscita per il dst_mac
- *   - forward/drop: il pacchetto viene inviato sull'altra porta o droppato
+ * Il bridge supporta da 2 a MAX_N_PORTS porte fisiche.
+ * Il numero effettivo di porte è stabilito a runtime (-n flag sulla command line).
+ *
+ * Ogni pacchetto ricevuto su una porta viene elaborato dalla GPU A30X:
+ *   - backward learning: src_mac → porta di ingresso nella FIB
+ *   - FIB lookup: dst_mac → porta di uscita (unicast), -1 (flood) o drop
+ *   - WQE filling parallelo con atomicAdd: ogni thread scrive il proprio WQE
+ *   - zero-copy cross-port: i WQE puntano al buffer GPU della porta sorgente
+ *
+ * Uso:
+ *   sudo ip netns exec bf2 ./gpu_bridge \
+ *       -n ad:00.0 -n ad:00.1 [-n <pci_portaN>...] -g b0:00.0
  */
 
 #ifndef GPU_BRIDGE_H
@@ -29,46 +36,51 @@
 #include <doca_flow.h>
 
 /* =========================================================================
+ * COSTANTI — NUMERO DI PORTE
+ * =========================================================================
+ *
+ * MAX_N_PORTS: numero massimo di porte supportate a compile time.
+ *   Dimensiona gli array statici in kernel params e bridge_port.
+ *   Il numero effettivo di porte (n_ports) viene passato al kernel a runtime.
+ *
+ * 8 è sufficiente per BF2/BF3 con SR-IOV VF e porta di management.
+ */
+#define MAX_N_PORTS 8
+
+/* =========================================================================
  * COSTANTI — CODA DI RICEZIONE (RXQ)
  * =========================================================================
  *
- * MAX_PKT_NUM: slot nel ring buffer della rxq.
- *   La BF2 DMA i pacchetti in questo buffer circolare in GPU memory.
+ * MAX_PKT_NUM: slot nel ring buffer ciclico (CYCLIC RXQ).
+ *   La NIC DMA i pacchetti in questo buffer circolare in VRAM.
  *   16384 slot × MAX_PKT_SIZE byte = 32 MB per porta.
  *
- * MAX_PKT_SIZE: dimensione massima per pacchetto, in byte.
- *   2048 per Ethernet standard (MTU 1500 + header 14B + padding).
+ * MAX_PKT_SIZE: dimensione massima per pacchetto (Ethernet 1500 + overhead).
  *
- * MAX_RX_TIMEOUT_NS: quanto aspetta la recv del cuda kernel prima di tornare a mani
- *   vuote. 500 µs è un buon compromesso percgè se arriva Ctrl+C  non devo aspettare troppo
- *   prima di uscire effettivamente dal programma e anche senza sprecare cicli GPU in loop vuoti
- *   perchè se fosse troppo breve potrei ritornare più spesso senza pacchetti.
+ * MAX_RX_TIMEOUT_NS: timeout della recv nel kernel.
+ *   500 µs: buon compromesso tra reattività al Ctrl+C e efficienza.
  *
- * MAX_RX_NUM_PKTS: quanti pacchetti può restituire una singola recv call.
- *   Con EXEC_SCOPE_BLOCK e 32 thread, ogni thread processa fino a
- *   MAX_RX_NUM_PKTS / 32 = 64 pacchetti in parallelo.
+ * MAX_RX_NUM_PKTS: max pacchetti per singola recv call.
+ *   32 thread × 64 = 2048 pacchetti elaborabili in parallelo.
  */
 #define MAX_PKT_NUM       16384
 #define MAX_PKT_SIZE      2048
-#define MAX_RX_TIMEOUT_NS 500000    
+#define MAX_RX_TIMEOUT_NS 500000
 #define MAX_RX_NUM_PKTS   2048
 
 /* =========================================================================
  * COSTANTI — CODA DI TRASMISSIONE (TXQ)
  * =========================================================================
  *
- * MAX_SQ_DESCR_NUM: numero di Work Queue Entry (WQE) nel Send Queue della TXQ.
- *   Ogni WQE = istruzione per la NIC "invia questi N byte da questo indirizzo".
- *   1024 WQE è abbondante per i burst tipici (ma MAX_RX_NUM_PKTS = 2048,
- *   ma i WQE si consumano in ordine e la NIC li processa velocemente).
+ * MAX_SQ_DESCR_NUM: Work Queue Entry (WQE) nel Send Queue della TXQ.
+ *   Con flooding a N porte, ogni pacchetto può generare N-1 WQE.
+ *   1024 WQE è conservativo; la NIC li consuma velocemente.
  */
 #define MAX_SQ_DESCR_NUM  1024
 
 /* =========================================================================
  * COSTANTI — DOCA FLOW
  * =========================================================================
- *
- * FLOW_NB_COUNTERS: numero di contatori hardware per statistiche sulle pipe.
  */
 #define FLOW_NB_COUNTERS  512
 
@@ -76,13 +88,11 @@
  * COSTANTI — CUDA KERNEL
  * =========================================================================
  *
- * BRIDGE_BLOCK_THREADS: thread nel blocco CUDA del kernel bridge.
- *   Deve essere esattamente 32 = 1 warp NVIDIA.
- *
- *   Perché 32? EXEC_SCOPE_BLOCK con 32 thread = 1 warp intero.
- *   La chiamata doca_gpu_dev_eth_rxq_recv<BLOCK> usa TUTTI i 32 thread
- *   cooperativamente per ricevere il batch. Con esattamente 1 warp,
- *   la sincronizzazione è garantita dall'hardware (warp execution)
+ * BRIDGE_BLOCK_THREADS = 32 = 1 warp NVIDIA.
+ * Richiesto da EXEC_SCOPE_BLOCK: tutti i thread cooperano per la recv.
+ * Con esattamente 1 warp, la sincronizzazione intra-warp è gratuita (lockstep).
+ * Avere 1 solo warp garantisce la proprietà di lockstep usata per il
+ * tracking del "last WQE" (vedi gpu_bridge_kernel.cu).
  */
 #define BRIDGE_BLOCK_THREADS 32
 
@@ -90,151 +100,66 @@
  * COSTANTI — MAC TABLE (FIB)
  * =========================================================================
  *
- * MAC_TABLE_SIZE: numero di slot nella hash table.
- *   Deve essere potenza di 2: usiamo (h & (SIZE-1)) invece di (h % SIZE),
- *   che è molto più veloce sulla GPU (AND vs divisione)
- *   4096 = 4K entry: sufficiente per una LAN tipica.
+ * Formato entry uint64_t:
+ *   bit 63:    valid flag (1 = slot occupato, 0 = slot vuoto)
+ *   bit 48-55: porta di uscita (0..255, supporta fino a 256 porte)
+ *   bit 0-47:  MAC address a 48 bit
  *
- * MAC_TABLE_PROBE_MAX: se lo slot calcolato è già occupato da un MAC diverso, prova lo slot successivo (slot + 1)
- *   poi il successivo ancora, finché non trova o lo stesso MAC (aggiorna) o uno slot vuoto (lo inserisce lì)
- *   quindi max probe steps nel linear probing prima di rinunciare.
- *   256 significa che esploriamo fino a 256 slot consecutivi prima di dichiarare
- *   la tabella "piena" per quel bucket
- *   di conseguenza il lookup tornerà -1 come se il MAC non sia stato trovato quindi farà flooding,
- *   il mac_learn che è l'inserimento del mac nella tabella fallisce in maniera silenziosa
+ * Con MAX_N_PORTS = 8, i valori del campo porta sono 0-7.
+ * I bit 56-62 sono riservati e sempre zero.
  *
- * MAC_ENTRY_VALID_BIT: bit 63 di un'entry uint64_t = slot occupato.
- *   Questo permette di distinguere slot vuoto (entry==0) da un entry per
- *   il MAC 00:00:00:00:00:00 (entry = VALID_BIT | 0 = solo bit 63 acceso).
- *
- * MAC_ENTRY_PORT_SHIFT: il numero di porta (0 o 1) è al bit 48.
- *   Bit 63:    valid flag
- *   Bit 48:    porta (0 = prima porta BF2, 1 = seconda porta BF2)
- *   Bit 0-47:  MAC address a 48 bit
+ * MAC_TABLE_SIZE deve essere potenza di 2 per l'AND hash trick.
+ * MAC_TABLE_PROBE_MAX: passi max di linear probing prima di rinunciare.
+ *   Con tabella piena: mac_lookup ritorna -1 (flood), mac_learn ignora.
  */
 #define MAC_TABLE_SIZE       4096
 #define MAC_TABLE_PROBE_MAX  256
 #define MAC_ENTRY_VALID_BIT  ((uint64_t)1 << 63)
 #define MAC_ENTRY_PORT_SHIFT 48
-#define MAC_48BIT_MASK       0x0000FFFFFFFFFFFFULL
-
-/* =========================================================================
- * COSTANTI — NUMERO DI PORTE
- * =========================================================================
- */
-#define BRIDGE_NUM_PORTS 2
+#define MAC_ENTRY_PORT_MASK  0x00FF000000000000ULL  /* bit 48-55: porta (0-255) */
+#define MAC_48BIT_MASK       0x0000FFFFFFFFFFFFULL  /* bit 0-47:  MAC address */
 
 /* =========================================================================
  * MACRO — ALLINEAMENTO MEMORIA
  * =========================================================================
- * doca_gpu_mem_alloc richiede che la dimensione sia multiplo della page size.
  */
 #define ALIGN_UP(sz, align) (((sz) + (align) - 1) / (align) * (align))
 
 /* =========================================================================
  * STRUTTURA bridge_port
  * =========================================================================
- * Rappresenta UNA delle due porte fisiche del bridge.
- * Il main alloca un array: struct bridge_port ports[BRIDGE_NUM_PORTS].
+ * Rappresenta una porta fisica del bridge.
+ * Il main alloca: struct bridge_port ports[n_ports] con n_ports ≤ MAX_N_PORTS.
  *
- * ┌─────────────────────────────────────────────────────────────────────┐
- * │  FLUSSO DEI DATI PER UNA PORTA (es. porta 0)                        │
- * │                                                                      │
- * │  [Rete] ──DMA_write──> [rxq_buf in GPU memory ]                      │
- * │                               │                                      │
- * │                        kernel CUDA legge                             │
- * │                               │                                      │
- * │                        [WQE su TXQ1] ──DMA_read──> [Rete porta 1]   │
- * │                                                                      │
- * │  I WQE di TXQ1 puntano a rxq_buf di porta 0 con rxq_mkey_for_other  │
- * │  (cross-port zero-copy: nessuna copia dei dati)                      │
- * └─────────────────────────────────────────────────────────────────────┘
+ * Cross-port mkey (generalizzato a N porte):
+ *   rxq_mkey_for_port[q] = mkey del buffer GPU di questa porta,
+ *                           valido per la NIC della porta q.
+ *   Ottenuto con: doca_mmap_get_mkey(rxq_mmap, all_ddevs[q], &mkey)
+ *   dopo aver chiamato doca_mmap_add_dev(rxq_mmap, all_ddevs[q]) per ogni q.
+ *
+ *   La NIC porta q può fare DMA READ dal buffer GPU di questa porta usando
+ *   rxq_mkey_for_port[q] come Authorization Key nei propri WQE di trasmissione.
+ *   Questo è necessario perché ogni NIC ha un Protection Domain (PD) RDMA
+ *   separato: la chiave mkey[self] non è valida per un'altra NIC.
  */
 struct bridge_port {
-
-    /* ── Device DOCA della NIC per questa porta ─────────────────────────
-     * Aperto con doca_dev_open() tramite PCI address (es. "ad:00.0").
-     * Usato per creare RXQ, TXQ e la porta DOCA Flow.
-     */
     struct doca_dev *ddev;
 
-    /* ── Coda di Ricezione (RXQ) ──────────────────────────────────────
-     *
-     * La NIC BF2 riceve pacchetti dalla rete e li scrive DIRETTAMENTE
-     * nella GPU memory (rxq_buf) tramite DMA peer-to-peer (gdrcopy/dmabuf).
-     * Nessun coinvolgimento della CPU: la NIC parla direttamente con la A30.
-     *
-     * rxq_ctx:  vista generica "doca_ctx" di rxq_cpu (doca_eth_rxq_as_doca_ctx).
-     *   Serve per le API comuni a tutte le librerie DOCA: assegnare il data
-     *   path alla GPU (doca_ctx_set_datapath_on_gpu) e avviare/fermare la
-     *   coda presso la NIC (doca_ctx_start / doca_ctx_stop).
-     * rxq_cpu:  handle usato durante il setup (da questo file .c)
-     * rxq_gpu:  handle passato al kernel CUDA (puntatore a struttura in GPU)
-     * rxq_mmap: descrive rxq_buf alla NIC tramite RDMA registration altrimenti non potrebbe farci DMA
-     * rxq_buf:  il buffer ciclico in GPU memory dove arrivano i pacchetti
-     * rxq_dmabuf_fd: file descriptor per DMABuf (se supportato dal kernel)
-     *
-     * rxq_mkey_for_own_txq:   mkey per la NIC di QUESTA porta.
-     *   Usato quando la TXQ di questa porta legge dal proprio rxq_buf
-     *   (non usato nel bridge normale, ma disponibile per loopback/debug).
-     *
-     * rxq_mkey_for_other_txq: mkey per la NIC dell'ALTRA porta.
-     *   Questo è il mkey per il forwarding cross-port zero-copy:
-     *   la TXQ dell'altra porta usa questo mkey per leggere da rxq_buf
-     *   di questa porta.
-     *
-     *   Perché servono due mkey diversi?
-     *   In InfiniBand/RDMA, ogni dispositivo NIC ha un proprio Protection
-     *   Domain (PD) con chiavi di accesso separate. La porta 1 non può usare
-     *   il mkey della porta 0 e viceversa. Per permettere alla porta 1 di
-     *   leggere il buffer GPU della porta 0, registriamo quel buffer in
-     *   entrambi i PD: doca_mmap_add_dev(mmap, ddev0) + doca_mmap_add_dev(mmap, ddev1),
-     *   poi doca_mmap_get_mkey(mmap, ddev1) ci dà il mkey corretto per la porta 1.
-     */
+    /* ── Coda di ricezione (RXQ GPU CYCLIC) ─────────────────────────── */
     struct doca_ctx         *rxq_ctx;
     struct doca_eth_rxq     *rxq_cpu;
     struct doca_gpu_eth_rxq *rxq_gpu;
     struct doca_mmap        *rxq_mmap;
     void                    *rxq_buf;
     int                      rxq_dmabuf_fd;
-    uint32_t                 rxq_mkey_for_own_txq;    /* mkey per questa NIC */
-    uint32_t                 rxq_mkey_for_other_txq;  /* mkey per l'altra NIC */
+    uint32_t                 rxq_mkey_for_port[MAX_N_PORTS]; /* [q] = mkey per NIC porta q */
 
-    /* ── Coda di Trasmissione (TXQ) ───────────────────────────────────
-     *
-     * Il kernel CUDA scrive WQE (Work Queue Entry) nella TXQ.
-     * Ogni WQE contiene: [indirizzo GPU sorgente] [mkey] [dimensione] [flags].
-     * La NIC legge i WQE e fa DMA dalla GPU verso la rete.
-     *
-     * IMPORTANTE: la TXQ NON ha un proprio buffer dati.
-     * I WQE puntano al buffer rxq_buf dell'ALTRA porta (zero-copy cross-port).
-     *
-     * txq_cpu:  handle usato nel setup
-     * txq_gpu:  handle passato al kernel CUDA
-     */
+    /* ── Coda di trasmissione (TXQ GPU) ─────────────────────────────── */
     struct doca_ctx         *txq_ctx;
     struct doca_eth_txq     *txq_cpu;
     struct doca_gpu_eth_txq *txq_gpu;
 
-    /* ── DOCA Flow ─────────────────────────────────────────────────────
-     *
-     * DOCA Flow è il sistema di hardware packet steering della BF2.
-     * Instrada i pacchetti in arrivo verso la GPU RXQ.
-     *
-     * Per il bridge vogliamo catturare TUTTO il traffico L2:
-     *   - IPv4  (ethertype 0x0800)
-     *   - ARP   (ethertype 0x0806)
-     *   - IPv6  (ethertype 0x86DD)
-     *   - qualsiasi altro ethertype
-     *
-     * Usiamo una singola BASIC ROOT pipe con match template = {0} (tutti
-     * i campi a zero = wildcard su qualsiasi campo) e una sola entry che
-     * cattura qualsiasi pacchetto e lo manda alla queue 0 (la GPU RXQ).
-     *
-     * flow_port:  handle DOCA Flow per questa porta (ID univoco 0 o 1)
-     * root_pipe:  la BASIC ROOT pipe con match wildcard
-     * root_entry: l'unica entry wildcard nella root pipe
-     */
+    /* ── DOCA Flow: BASIC ROOT pipe con match wildcard ───────────────── */
     struct doca_flow_port       *flow_port;
     struct doca_flow_pipe       *root_pipe;
     struct doca_flow_pipe_entry *root_entry;
@@ -243,32 +168,31 @@ struct bridge_port {
 /* =========================================================================
  * STRUTTURA bridge_kernel_params
  * =========================================================================
- * Raggruppa tutti i parametri da passare al kernel CUDA.
- * Allocata sullo stack del main (memoria CPU), i puntatori interni puntano
- * a memoria GPU o handle GPU-side.
+ * Passata per valore al kernel CUDA tramite il wrapper extern "C".
+ * CUDA copia l'intera struct in kernel parameter memory (≤4 KB):
+ *   con MAX_N_PORTS=8: ~416 byte, ben entro il limite.
+ *
+ * rxq_mkey[p]:
+ *   mkey del buffer GPU della porta p.
+ *   Su BF2 entrambe le porte condividono lo stesso PD RDMA, quindi questo
+ *   mkey è valido per qualsiasi TXQ del bridge (zero-copy cross-port).
+ *   Calcolato come: ports[p].rxq_mkey
  */
 struct bridge_kernel_params {
-    struct doca_gpu_eth_rxq *rxq_gpu[BRIDGE_NUM_PORTS]; /* handle GPU delle RXQ */
-    struct doca_gpu_eth_txq *txq_gpu[BRIDGE_NUM_PORTS]; /* handle GPU delle TXQ */
-
-    /* mkey_for_other[i]: mkey del buffer rxq della porta i,
-     * valido per la NIC dell'altra porta (per zero-copy cross-port TX).
-     *   mkey_for_other[0] = rxq_mkey_for_other_txq di ports[0]
-     *                      → usato dai WQE di txq1 per leggere il buffer di rxq0
-     *   mkey_for_other[1] = rxq_mkey_for_other_txq di ports[1]
-     *                      → usato dai WQE di txq0 per leggere il buffer di rxq1
-     */
-    uint32_t rxq_mkey_for_other[BRIDGE_NUM_PORTS];
-
-    uint64_t *mac_table;   /* hash table FIB in GPU memory (cudaMalloc) */
-    uint32_t *exit_cond;   /* 0=running, 1=stop (GPU_CPU: GPU la legge veloce, CPU la scrive) */
-    uint64_t *fwd_count;   /* contatore forward (CPU_GPU: CPU la legge veloce dopo sync) */
+    int      n_ports;
+    struct doca_gpu_eth_rxq *rxq_gpu[MAX_N_PORTS];
+    struct doca_gpu_eth_txq *txq_gpu[MAX_N_PORTS];
+    uint32_t rxq_mkey_cross[MAX_N_PORTS][MAX_N_PORTS]; /* [src][dst] = mkey rxq[src] per NIC dst */
+    uint64_t *mac_table;
+    uint32_t *exit_cond;
+    uint64_t *fwd_count;
 };
 
 /* =========================================================================
- * DICHIARAZIONE DEL WRAPPER KERNEL (definito in gpu_bridge_kernel.cu)
+ * DICHIARAZIONE WRAPPER KERNEL
  * =========================================================================
- * extern "C": necessario perché il .cu usa C++ name mangling ma il .c no.
+ * Il wrapper in gpu_bridge_kernel.cu prende il puntatore (convenzione C),
+ * lo dereferenzia e passa la struct per valore al kernel CUDA.
  */
 #ifdef __cplusplus
 extern "C" {

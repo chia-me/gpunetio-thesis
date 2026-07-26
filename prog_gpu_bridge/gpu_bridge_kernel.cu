@@ -1,40 +1,66 @@
 /*
- * gpu_bridge_kernel.cu — kernel CUDA per il GPU L2 Bridge.
+ * gpu_bridge_kernel.cu — kernel CUDA per il GPU L2 Bridge a N porte.
  *
  * ARCHITETTURA DEL KERNEL:
  *
  *   Un solo kernel persistente, 1 blocco, 32 thread (= 1 warp NVIDIA).
- *   Il kernel gira per sempre finché il CPU non scrive 1 in exit_cond.
+ *   Il kernel gira per sempre finché la CPU non scrive 1 in exit_cond.
  *
- *   Il loop principale alterna tra due direzioni:
+ *   Il loop principale itera su tutte le N porte sorgente:
  *
- *     Direzione A: porta 0 → porta 1
- *       Riceve da rxq0, processa, invia su txq1.
+ *     per ogni porta src (0..n_ports-1):
+ *       Riceve da rxq[src], processa, invia verso le porte di uscita.
  *
- *     Direzione B: porta 1 → porta 0
- *       Riceve da rxq1, processa, invia su txq0.
+ *   Per ogni porta sorgente, il processing ha tre fasi:
  *
- *   Per ogni direzione, la fase di elaborazione ha due sotto-fasi:
+ *     Fase 1 — inizializzazione contatori batch (solo thread 0):
+ *       Reset next_wqe_slot[q] e last_wqe_pkt_*[q] per ogni TXQ.
  *
- *     Fase parallela (tutti e 32 i thread in contemporanea):
- *       Ogni thread elabora i propri pacchetti (indici t, t+32, t+64, ...):
- *         1. Legge dst_mac e src_mac dall'header Ethernet
- *         2. Backward learning: inserisce src_mac → porta_ingresso nella FIB
- *         3. FIB lookup: cerca dst_mac, ottiene porta_uscita o -1 (flood)
- *         4. Scrive fwd_decision[i] = 1 (forward) o 0 (drop)
+ *     Fase 2 — parallela (tutti i 32 thread contemporaneamente):
+ *       Ogni thread gestisce i propri pacchetti (t, t+32, t+64, ...):
+ *         1. Backward learning: src_mac → porta src nella FIB
+ *         2. FIB lookup: dst_mac → porta (o -1 per flood)
+ *         3. Calcola egress_mask (bitmask porte di uscita)
+ *         4. Per ogni bit q in egress_mask:
+ *            a. atomicAdd su next_wqe_slot[q] → ottiene slot consecutivo
+ *            b. Aggiorna last_wqe_pkt_*[q] (per il fixup NOTIFY)
+ *            c. Riempie WQE su txq[q] senza NOTIFY
  *
- *     Fase seriale (solo thread 0):
- *       Legge tutti i fwd_decision[], riempie WQE consecutivi sulla TXQ
- *       di destinazione, chiama submit (doorbell), aspetta CQE.
- *       Thread 0 deve essere seriale per assegnare indici WQE contigui
- *       (non possiamo avere buchi nella sequenza di WQE).
+ *     Fase 3 — seriale (solo thread 0):
+ *       Per ogni TXQ q con WQE in questo batch:
+ *         a. Ri-riempie l'ULTIMO WQE con flag NOTIFY (fixup)
+ *         b. Suona il doorbell (submit)
+ *         c. Aspetta il CQE (poll_completion_at)
+ *
+ * PERCHÉ atomicAdd PER I WQE (insight: la TXQ è un ring circolare):
+ *   I WQE devono avere indici consecutivi senza buchi nel ring.
+ *   Con atomicAdd ogni thread ottiene uno slot unico e consecutivo
+ *   senza dover fare prefix sum o serializzare tutta la fase di fill.
+ *   Il ring è circolare: non serve sapere il numero totale di pacchetti
+ *   già inviati (al contrario di un buffer lineare dove servirebbe
+ *   un offset globale). L'unico vincolo è NOTIFY sul LAST WQE del batch.
+ *
+ * PROPRIETÀ "LAST WRITE WINS" IN UN SINGOLO WARP:
+ *   Con 32 thread = 1 warp (lockstep hardware NVIDIA), le atomicAdd su
+ *   next_wqe_slot[q] sono serializzate in lane-order (thread 0, 1, ..., 31).
+ *   Il thread con lo slot più alto per TXQ q è anche l'ULTIMO ad aggiornare
+ *   last_wqe_pkt_*[q] in quella iterazione del while loop.
+ *   Poiché le iterazioni del while loop sono sequenziali (lockstep),
+ *   dopo il while loop last_wqe_pkt_*[q] contiene i dati dell'ultimo WQE
+ *   (quello con l'indice più alto = quello che thread 0 deve ri-riempire
+ *   con NOTIFY). Questa proprietà è valida SOLO per un singolo warp.
+ *
+ * FLOODING A N PORTE:
+ *   egress_mask = ((1u << n_ports) - 1u) & ~(1u << src)
+ *   Un pacchetto floodato genera n_ports-1 WQE (uno per ogni altra TXQ).
+ *   Ogni WQE usa il mkey di rxq[src] valido per la NIC della porta di uscita.
+ *   Con 8 porte e 2048 pacchetti floodati: 14336 WQE totali.
  *
  * ZERO-COPY CROSS-PORT:
- *   I WQE di txq1 puntano direttamente ai dati in GPU memory di rxq0.
- *   La NIC porta 1 fa DMA direttamente dalla GPU senza nessuna copia.
- *   Il mkey rxq0_mkey_for_txq1 è necessario perché la NIC porta 1
- *   ha un Protection Domain RDMA diverso dalla NIC porta 0:
- *   deve avere una chiave valida per accedere alla memoria GPU di porta 0.
+ *   I WQE di txq[q] puntano direttamente ai dati in GPU memory di rxq[src].
+ *   La NIC porta q fa DMA dalla GPU senza nessuna copia CPU/GPU.
+ *   Il mkey rxq_mkey_cross[src][q] autorizza la NIC q ad accedere
+ *   al buffer GPU della porta src (PD RDMA separato per ogni NIC).
  */
 
 #include <stdio.h>
@@ -45,21 +71,13 @@
 #include "gpu_bridge.h"
 
 /* =========================================================================
- * FUNZIONI DEVICE — MAC TABLE
+ * FUNZIONI DEVICE — MAC TABLE (FIB)
  * =========================================================================
- * Funzioni __device__: girano solo sulla GPU, chiamate dal kernel.
- * __forceinline__: il compilatore le inline (elimina overhead chiamata).
  */
 
 /*
- * mac_to_u64: converte 6 byte di MAC address (network byte order) in uint64_t.
- *
- * Header Ethernet: il byte [0] è il più significativo (MAC big-endian).
- * Esempio: MAC aa:bb:cc:dd:ee:ff → uint64_t 0x0000aabbccddeeff
- *
- * Perché uint64_t e non array di byte?
- * Perché è più comodo fare confronti con == e usare come chiave hash.
- * I 16 bit superiori sono sempre 0 (MAC è 48 bit, uint64_t è 64 bit).
+ * mac_to_u64: converte 6 byte MAC (network order) in uint64_t (bit 0-47).
+ * Byte [0] = più significativo. Bit 48-63 sempre zero.
  */
 static __device__ __forceinline__ uint64_t mac_to_u64(const uint8_t *mac)
 {
@@ -72,19 +90,14 @@ static __device__ __forceinline__ uint64_t mac_to_u64(const uint8_t *mac)
 }
 
 /*
- * mac_hash: hash FNV-1a (Fowler–Noll–Vo) di un MAC a 48 bit.
- *
- * FNV-1a: per ogni byte, XOR con l'hash corrente, poi moltiplica per una costante.
- * È veloce (no divisione, no branch), ha buona distribuzione su input corti.
- *
- * Il risultato viene mascherato con (MAC_TABLE_SIZE - 1) = 4095.
- * Poiché MAC_TABLE_SIZE è potenza di 2, (h & 4095) == (h % 4096) ma senza
- * divisione hardware (molto più veloce su GPU dove la divisione è costosa).
+ * mac_hash: hash FNV-1a a 32 bit sul MAC a 48 bit.
+ * Veloce su GPU (no divisione), buona distribuzione su input corti.
+ * Risultato mascherato con (MAC_TABLE_SIZE - 1) = 4095 (AND, non modulo).
  */
 static __device__ __forceinline__ uint32_t mac_hash(uint64_t mac48)
 {
-    uint32_t h = 2166136261u;          /* FNV offset basis 32-bit */
-    h ^= (uint8_t)(mac48 >> 40); h *= 16777619u;   /* FNV prime 32-bit */
+    uint32_t h = 2166136261u;
+    h ^= (uint8_t)(mac48 >> 40); h *= 16777619u;
     h ^= (uint8_t)(mac48 >> 32); h *= 16777619u;
     h ^= (uint8_t)(mac48 >> 24); h *= 16777619u;
     h ^= (uint8_t)(mac48 >> 16); h *= 16777619u;
@@ -94,93 +107,52 @@ static __device__ __forceinline__ uint32_t mac_hash(uint64_t mac48)
 }
 
 /*
- * mac_learn: registra nella FIB che 'mac48' è raggiungibile sulla 'porta'.
+ * mac_learn: registra nella FIB che mac48 è raggiungibile sulla porta src_port.
  *
- * FORMATO ENTRY uint64_t:
- *   bit 63:   valid (1 = slot occupato, 0 = slot vuoto)
- *   bit 48:   numero porta (0 o 1)
- *   bit 0-47: MAC address
+ * FORMATO ENTRY (uint64_t):
+ *   bit 63:    valid (1 = slot occupato)
+ *   bit 48-55: porta (0..MAX_N_PORTS-1)
+ *   bit 0-47:  MAC address
  *
- * ALGORITMO — linear probing con atomici per thread-safety:
- *
- *   slot = mac_hash(mac48)
- *   per probe = 0 .. MAC_TABLE_PROBE_MAX:
- *     leggi mac_table[slot] (volatile)
- *     se slot vuoto (val == 0):
- *       atomicCAS(slot, 0, nuova_entry)
- *       se CAS riuscito (old == 0): return (inserimento ok)
- *       se CAS fallito: un altro thread ha preso il posto → rileggi e riprova
- *     se slot ha questo stesso MAC:
- *       atomicExch(slot, nuova_entry) → aggiorna porta
- *       return
- *     altrimenti: slot occupato da MAC diverso → linear probe al prossimo
- *
- * THREAD-SAFETY:
- *   atomicCAS e atomicExch operano atomicamente su uint64_t in global memory.
- *   La consistenza è eventual: se due thread imparano lo stesso MAC
- *   contemporaneamente, uno dei due vince il CAS; l'altro rilegge e trova
- *   il proprio MAC già presente, quindi fa atomicExch per aggiornare la porta.
- *   Risultato: sempre consistente, mai corrotto.
- *
- * CASO TABELLA PIENA:
- *   Se non troviamo uno slot libero entro MAC_TABLE_PROBE_MAX tentativi,
- *   rinunciamo silenziosamente. Il pacchetto sarà trattato come "flooding"
- *   (destinazione sconosciuta), comportamento corretto per un bridge.
+ * ALGORITMO — linear probing con atomici (thread-safe):
+ *   slot vuoto:      atomicCAS(0 → nuova_entry) per inserire
+ *   stesso MAC:      atomicExch per aggiornare la porta
+ *   MAC diverso:     linear probe al prossimo slot
+ *   tabella piena:   rinuncia silenziosamente (flood come fallback)
  */
-static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int porta)
+static __device__ void mac_learn(uint64_t *mac_table, uint64_t mac48, int src_port)
 {
     uint64_t nuova_entry = MAC_ENTRY_VALID_BIT |
-                           ((uint64_t)(uint32_t)porta << MAC_ENTRY_PORT_SHIFT) |
-                           mac48;
+                           ((uint64_t)(src_port & 0xFF) << MAC_ENTRY_PORT_SHIFT) |
+                           (mac48 & MAC_48BIT_MASK);
     uint32_t slot = mac_hash(mac48);
 
     for (int probe = 0; probe < MAC_TABLE_PROBE_MAX; probe++) {
-        /* Lettura volatile: impedisce al compilatore di cacheare in un registro */
         uint64_t val = *(volatile uint64_t *)&mac_table[slot];
 
         if (val == 0) {
-            /* Slot vuoto: prova ad occuparlo */
             uint64_t old = atomicCAS((unsigned long long *)&mac_table[slot],
                                      0ULL,
                                      (unsigned long long)nuova_entry);
             if (old == 0)
-                return;  /* CAS riuscito: inserimento completato */
-
-            /* CAS fallito: un altro thread ha riempito il posto.
-             * 'old' è il valore che c'era quando abbiamo tentato.
-             * Controlliamo se è il nostro stesso MAC (caso aggiornamento). */
+                return;
             val = old;
         }
 
-        /* Slot occupato: è il nostro MAC? */
-        if ((val & MAC_48BIT_MASK) == mac48) {
-            /* Stesso MAC già presente: aggiorna la porta */
+        if ((val & MAC_48BIT_MASK) == (mac48 & MAC_48BIT_MASK)) {
             atomicExch((unsigned long long *)&mac_table[slot],
                        (unsigned long long)nuova_entry);
             return;
         }
 
-        /* MAC diverso: linear probe al prossimo slot */
         slot = (slot + 1) & (MAC_TABLE_SIZE - 1);
     }
-    /* Tabella troppo piena per questo bucket: rinuncia */
 }
 
 /*
- * mac_lookup: cerca 'mac48' nella FIB.
- *
- * Ritorna:
- *    0 o 1 = porta dove si trova il MAC (trovato)
- *   -1     = MAC non trovato (flood: invia all'altra porta)
- *
- * Il linear probing si ferma al primo slot VUOTO (entry == 0).
- * Invariante del linear probing: se il MAC esistesse, sarebbe stato
- * trovato PRIMA di un slot vuoto (non ci sono "buchi" nelle catene
- * di probe, perché non cancelliamo mai entry dalla tabella).
- *
- * Lettura volatile: necessaria perché altri thread scrivono mac_table
- * con atomici. Senza volatile il compilatore potrebbe cacheare il valore
- * e non "vedere" le scritture concorrenti.
+ * mac_lookup: cerca mac48 nella FIB.
+ * Ritorna la porta (0..n_ports-1) o -1 (MAC sconosciuto = flood).
+ * Lettura volatile: vede le scritture atomiche degli altri thread.
  */
 static __device__ int mac_lookup(const uint64_t *mac_table, uint64_t mac48)
 {
@@ -189,466 +161,333 @@ static __device__ int mac_lookup(const uint64_t *mac_table, uint64_t mac48)
     for (int probe = 0; probe < MAC_TABLE_PROBE_MAX; probe++) {
         uint64_t entry = *(volatile uint64_t *)&mac_table[slot];
 
-        /* Slot vuoto: fine della catena di probe, MAC non trovato */
         if (entry == 0)
             return -1;
 
-        /* Trovato: valid bit acceso E MAC corrisponde */
         if ((entry & MAC_ENTRY_VALID_BIT) &&
-            (entry & MAC_48BIT_MASK) == mac48) {
-            return (int)((entry >> MAC_ENTRY_PORT_SHIFT) & 0x1);
+            (entry & MAC_48BIT_MASK) == (mac48 & MAC_48BIT_MASK)) {
+            /* Estrae 8 bit per la porta (supporta fino a 256 porte) */
+            return (int)((entry & MAC_ENTRY_PORT_MASK) >> MAC_ENTRY_PORT_SHIFT);
         }
 
         slot = (slot + 1) & (MAC_TABLE_SIZE - 1);
     }
-    return -1;  /* non trovato entro il limite di probe */
+    return -1;
 }
 
 /* =========================================================================
- * KERNEL PRINCIPALE
+ * KERNEL PRINCIPALE — bridge_kernel
  * =========================================================================
  *
- * Parametri kernel:
- *   rxq_gpu_p0 / rxq_gpu_p1: handle GPU per ricevere pacchetti (una per porta)
- *   txq_gpu_p0 / txq_gpu_p1: handle GPU per trasmettere pacchetti (una per porta)
- *   rxq0_mkey_for_txq1: chiave hardware che autorizza la NIC porta 1 a
- *       leggere il buffer GPU di porta 0 (per forwarding zero-copy p0→p1)
- *   rxq1_mkey_for_txq0: chiave hardware che autorizza la NIC porta 0 a
- *       leggere il buffer GPU di porta 1 (per forwarding zero-copy p1→p0)
- *   mac_table: hash table FIB in GPU global memory
- *   exit_cond: il CPU scrive 1 per fermare il kernel
- *   fwd_count: il kernel scrive il totale pacchetti forwardati (letto dal CPU)
+ * Dimensioni: <<<1, 32, 0, stream>>> (1 blocco, 32 thread = 1 warp)
+ *
+ * Il kernel riceve struct bridge_kernel_params PER VALORE.
+ * CUDA copia l'intera struct nella kernel parameter memory (≤4 KB).
+ * I puntatori interni (rxq_gpu, txq_gpu, mac_table, ...) puntano a
+ * memoria GPU o handle validi nel device, quindi sono validi nel kernel.
+ *
+ * SHARED MEMORY (condivisa da tutti i 32 thread):
+ *   rx_first_pkt_idx, rx_pkt_count, rx_attr[]:
+ *     Riempiti da doca_gpu_dev_eth_rxq_recv<BLOCK> cooperativamente.
+ *     rx_attr[i].bytes = lunghezza del pacchetto i.
+ *
+ *   next_wqe_slot[MAX_N_PORTS]:
+ *     Contatore atomico per slot WQE per ogni TXQ.
+ *     Ogni thread fa atomicAdd per ottenere il proprio slot consecutivo.
+ *     Azzerato all'inizio di ogni batch (per ogni porta src).
+ *
+ *   last_wqe_pkt_addr/bytes/mkey[MAX_N_PORTS]:
+ *     Info dell'ultimo WQE scritto per ogni TXQ.
+ *     Thread 0 le usa dopo __syncthreads() per ri-riempire l'ultimo
+ *     WQE con flag NOTIFY (fixup prima del submit).
+ *     "Last write wins" è garantito nel singolo warp (vedi header).
+ *
+ * VARIABILI PRIVATE DI THREAD 0 (solo usate in Fase 3):
+ *   wqe_base[MAX_N_PORTS]: prossimo indice WQE per ogni TXQ (persistente tra batch)
+ *   cqe_idx[MAX_N_PORTS]:  prossimo indice CQE per ogni TXQ (persistente tra batch)
+ *   tot_fwd:               totale pacchetti inoltrati
  */
-__global__ void bridge_kernel(
-    struct doca_gpu_eth_rxq *rxq_gpu_p0,
-    struct doca_gpu_eth_txq *txq_gpu_p0,
-    struct doca_gpu_eth_rxq *rxq_gpu_p1,
-    struct doca_gpu_eth_txq *txq_gpu_p1,
-    uint32_t                 rxq0_mkey_for_txq1,
-    uint32_t                 rxq1_mkey_for_txq0,
-    uint64_t                *mac_table,
-    uint32_t                *exit_cond,
-    uint64_t                *fwd_count)
+__global__ void bridge_kernel(struct bridge_kernel_params kp)
 {
-    /*
-     * SHARED MEMORY — condivisa tra tutti i 32 thread del blocco.
-     *
-     * rx_first_pkt_idx: indice nel ring buffer del primo pacchetto del batch.
-     *   Questo indice è "globale" nel ring: potrebbe valere es. 32768 dopo
-     *   molti batch. doca_gpu_dev_eth_rxq_get_pkt_addr gestisce il wrap-around.
-     *
-     * rx_pkt_count: quanti pacchetti ci sono in questo batch (0..MAX_RX_NUM_PKTS).
-     *
-     * rx_attr[]: attributi di ogni pacchetto (almeno .bytes = lunghezza).
-     *   Necessita shared memory perché doca_gpu_dev_eth_rxq_recv<BLOCK> la
-     *   riempie in modo cooperativo: ogni thread scrive le proprie entry.
-     *   Dopo __syncthreads(), tutti i thread possono leggere tutte le entry.
-     *
-     * fwd_decision[]: decisione di forward/drop per ogni pacchetto.
-     *   Scritta nella fase parallela, letta da thread 0 nella fase seriale.
-     *   Riusata tra le due direzioni (A e B) grazie a __syncthreads().
-     */
-    __shared__ uint64_t                          rx_first_pkt_idx;
-    __shared__ uint32_t                          rx_pkt_count;
-    __shared__ struct doca_gpu_dev_eth_rxq_attr  rx_attr[MAX_RX_NUM_PKTS];
-    __shared__ uint8_t                           fwd_decision[MAX_RX_NUM_PKTS];
+    /* ── Shared memory ─────────────────────────────────────────────────── */
+    __shared__ uint64_t rx_first_pkt_idx;
+    __shared__ uint32_t rx_pkt_count;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr rx_attr[MAX_RX_NUM_PKTS];
 
     /*
-     * Contatori WQE e CQE per ciascuna TXQ.
-     * Usati SOLO dal thread 0 (nelle fasi seriali di submit e poll).
-     *
-     * wqe_p1: prossimo indice WQE libero su txq1 (forwarding porta 0 → porta 1)
-     * cqe_p1: prossimo indice CQE atteso su txq1
-     * wqe_p0: prossimo indice WQE libero su txq0 (forwarding porta 1 → porta 0)
-     * cqe_p0: prossimo indice CQE atteso su txq0
-     *
-     * I WQE sono in un ring: il firmware della NIC usa (wqe_idx % MAX_SQ_DESCR_NUM)
-     * internamente. Noi teniamo il contatore monotonicamente crescente.
+     * next_wqe_slot[q]: contatore atomico per slot WQE su txq[q].
+     * Ogni thread fa atomicAdd per reclamare il proprio slot nel ring.
+     * Reset a zero prima di ogni batch.
      */
-    uint64_t wqe_p1 = 0, cqe_p1 = 0;
-    uint64_t wqe_p0 = 0, cqe_p0 = 0;
+    __shared__ uint32_t next_wqe_slot[MAX_N_PORTS];
+
+    /*
+     * Info dell'ultimo WQE per ogni TXQ (vedi commento nel file header).
+     * Aggiornate con semplici scritture (no atomic): la proprietà di lockstep
+     * del singolo warp garantisce che l'ultima scrittura corrisponda all'ultimo
+     * WQE (quello con l'indice più alto nel ring).
+     */
+    __shared__ uint64_t last_wqe_pkt_addr[MAX_N_PORTS];
+    __shared__ uint32_t last_wqe_pkt_bytes[MAX_N_PORTS];
+    __shared__ uint32_t last_wqe_pkt_mkey[MAX_N_PORTS];
+
+    /*
+     * wqe_base[q]: indice assoluto del prossimo WQE da scrivere per TXQ q.
+     * Deve essere __shared__ perché tutti i thread lo leggono in Fase 2B
+     * per calcolare l'indice assoluto del proprio WQE (wqe_base[q] + slot).
+     * Thread 0 lo aggiorna in Fase 3 dopo ogni batch.
+     * Se fosse locale, thread 1-31 avrebbero sempre wqe_base=0 e
+     * dal secondo batch in poi scriverebbero i WQE all'indice sbagliato.
+     */
+    __shared__ uint64_t wqe_base[MAX_N_PORTS];
+
+    /* cqe_idx e tot_fwd: acceduti solo da thread 0, possono stare in locale */
+    uint64_t cqe_idx[MAX_N_PORTS];
     uint64_t tot_fwd = 0;
-
     doca_error_t ret;
-    __syncthreads();  /* tutti i thread pronti prima di entrare nel loop */
 
-    /*
-     * LOOP PRINCIPALE: gira finché il CPU non scrive 1 in exit_cond.
-     *
-     * DOCA_GPUNETIO_VOLATILE(*exit_cond): legge exit_cond ogni iterazione
-     * dalla global memory GPU, bypassando qualsiasi cache del compilatore.
-     */
-    while (DOCA_GPUNETIO_VOLATILE(*exit_cond) == 0) {
-
-        /* ================================================================
-         * DIREZIONE A: PORTA 0 → PORTA 1
-         *
-         * Riceviamo da rxq0 (pacchetti arrivati dalla rete su porta 0,
-         * es. dall'Intel 810), processiamo con la FIB, inviamo su txq1
-         * (verso la rete collegata alla porta 1 della BF2).
-         * ================================================================ */
-
-        /*
-         * RICEZIONE (EXEC_SCOPE_BLOCK, tutti i 32 thread cooperano):
-         *
-         * Questa chiamata è bloccante: i 32 thread aspettano insieme
-         * finché arrivano pacchetti OPPURE scade il timeout di 500 µs.
-         * Se scade il timeout, rx_pkt_count = 0 e continuiamo il loop
-         * (questo ci permette di controllare exit_cond regolarmente).
-         *
-         * Internamente DOCA divide il ring buffer tra i 32 thread:
-         * thread t controlla le posizioni t, t+32, t+64, ...
-         * del ring buffer per vedere se la NIC ha scritto nuovi pacchetti.
-         * Quando tutti i thread hanno trovato i loro pacchetti (o è scaduto
-         * il timeout), si sincronizzano e riempono rx_first_pkt_idx,
-         * rx_pkt_count e rx_attr[].
-         */
-        ret = doca_gpu_dev_eth_rxq_recv<
-                DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
-                DOCA_GPUNETIO_ETH_MCST_AUTO,
-                DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,
-                DOCA_GPUNETIO_ETH_RX_ATTR_ALL>(
-            rxq_gpu_p0,
-            MAX_RX_NUM_PKTS,
-            MAX_RX_TIMEOUT_NS,
-            &rx_first_pkt_idx,
-            &rx_pkt_count,
-            rx_attr);
-
-        if (ret != DOCA_SUCCESS) {
-            if (threadIdx.x == 0)
-                DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-            break;
+    if (threadIdx.x == 0) {
+        for (int q = 0; q < MAX_N_PORTS; q++) {
+            wqe_base[q] = 0;
+            cqe_idx[q]  = 0;
         }
+    }
+    __syncthreads();
 
-        if (rx_pkt_count > 0) {
+    /* =====================================================================
+     * LOOP PRINCIPALE
+     * ===================================================================== */
+    while (DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) == 0) {
 
-            /* ============================================================
-             * FASE PARALLELA — tutti i 32 thread elaborano in parallelo.
+        /* Loop su tutte le porte sorgente (0, 1, ..., n_ports-1) */
+        for (int src = 0;
+             src < kp.n_ports && DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) == 0;
+             src++)
+        {
+            /* ==============================================================
+             * FASE 1: RICEZIONE
+             * Tutti i 32 thread cooperano (EXEC_SCOPE_BLOCK, 1 warp intero).
+             * Aspetta ≥1 pacchetto o MAX_RX_TIMEOUT_NS (500 µs).
+             * ============================================================== */
+            ret = doca_gpu_dev_eth_rxq_recv<
+                    DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
+                    DOCA_GPUNETIO_ETH_MCST_AUTO,
+                    DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,
+                    DOCA_GPUNETIO_ETH_RX_ATTR_ALL>(
+                kp.rxq_gpu[src],
+                MAX_RX_NUM_PKTS,
+                MAX_RX_TIMEOUT_NS,
+                &rx_first_pkt_idx,
+                &rx_pkt_count,
+                rx_attr);
+
+            if (ret != DOCA_SUCCESS) {
+                if (threadIdx.x == 0)
+                    DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) = 1;
+                break;
+            }
+
+            if (rx_pkt_count == 0)
+                continue;
+
+            /* ==============================================================
+             * FASE 2A: RESET CONTATORI BATCH (solo thread 0)
+             * ============================================================== */
+            if (threadIdx.x == 0) {
+                for (int q = 0; q < kp.n_ports; q++) {
+                    next_wqe_slot[q]      = 0;
+                    last_wqe_pkt_addr[q]  = 0;
+                    last_wqe_pkt_bytes[q] = 0;
+                    last_wqe_pkt_mkey[q]  = 0;
+                }
+            }
+            __syncthreads();
+
+            /* ==============================================================
+             * FASE 2B: BACKWARD LEARNING + FIB LOOKUP + WQE FILL PARALLELO
              *
-             * Round-robin: thread t gestisce i pacchetti con indice
-             *   t, t+32, t+64, t+96, ...
-             * Se rx_pkt_count = 100:
-             *   thread 0:  pacchetti 0, 32, 64, 96
-             *   thread 1:  pacchetti 1, 33, 65, 97
-             *   ...
-             *   thread 3:  pacchetti 3, 35, 67, 99
-             *   thread 4:  pacchetti 4, 36, 68  (99 < 100, 100 ≥ 100 → stop)
-             *   ...
-             * ============================================================ */
+             * Tutti i 32 thread in parallelo.
+             * Thread t gestisce pacchetti t, t+32, t+64, ...
+             *
+             * Per ogni pacchetto:
+             *   1. mac_learn(src_mac, src): impara la sorgente
+             *   2. mac_lookup(dst_mac): trova destinazione
+             *   3. Calcola egress_mask:
+             *      - drop (dst_port==src): mask=0
+             *      - flood (dst_port==-1): tutti i bit tranne src
+             *      - unicast:              solo bit dst_port
+             *   4. Per ogni bit q in egress_mask:
+             *      - atomicAdd → slot consecutivo su txq[q]
+             *      - aggiorna last_wqe_pkt_*[q] (last write wins in warp)
+             *      - riempi WQE senza NOTIFY
+             * ============================================================== */
             uint32_t pkt_idx = threadIdx.x;
             while (pkt_idx < rx_pkt_count) {
 
-                /*
-                 * Ottieni l'indirizzo del pacchetto nel buffer GPU di porta 0.
-                 * pkt_addr punta all'inizio dell'header Ethernet del pacchetto.
-                 * rx_first_pkt_idx + pkt_idx = indice assoluto nel ring buffer.
-                 * La funzione gestisce internamente il wrap-around del ring.
-                 */
                 uint64_t pkt_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
-                    rxq_gpu_p0, rx_first_pkt_idx + pkt_idx);
+                    kp.rxq_gpu[src], rx_first_pkt_idx + pkt_idx);
                 const uint8_t *eth = (const uint8_t *)(uintptr_t)pkt_addr;
 
-                /*
-                 * Leggi dst_mac (byte 0-5) e src_mac (byte 6-11) dall'header.
-                 *
-                 * Layout header Ethernet IEEE 802.3:
-                 *   [0..5]:   dst MAC  (destinatario del frame)
-                 *   [6..11]:  src MAC  (mittente del frame)
-                 *   [12..13]: ethertype (0x0800=IPv4, 0x0806=ARP, 0x86DD=IPv6, ...)
-                 *   [14+]:    payload (IP, ARP, etc.)
-                 *
-                 * Il bridge non guarda ethertype o payload: lavora solo su MAC.
-                 */
                 uint64_t dst_mac48 = mac_to_u64(eth);       /* byte 0-5 */
                 uint64_t src_mac48 = mac_to_u64(eth + 6);   /* byte 6-11 */
 
-                /*
-                 * BACKWARD LEARNING:
-                 * "Questo frame è arrivato su porta 0 con src_mac X →
-                 *  il dispositivo con MAC X si trova sulla porta 0."
-                 *
-                 * Aggiorniamo la FIB. La prossima volta che vediamo un
-                 * pacchetto con dst_mac == X, lo inviamo sulla porta 0.
-                 */
-                mac_learn(mac_table, src_mac48, 0);
+                /* Backward learning: il mittente è raggiungibile su 'src' */
+                mac_learn(kp.mac_table, src_mac48, src);
+
+                /* FIB lookup: verso quale porta mandare dst_mac? */
+                int dst_port = mac_lookup(kp.mac_table, dst_mac48);
 
                 /*
-                 * FIB LOOKUP:
-                 * "Dove devo inviare questo frame con dst_mac?"
+                 * Calcolo egress_mask (uint32_t, bit q = "invia a porta q"):
                  *
-                 *   -1: dst_mac sconosciuto → flood (manda all'altra porta)
-                 *    0: dst_mac è su porta 0 → DROP (stessa porta di ingresso)
-                 *    1: dst_mac è su porta 1 → FORWARD su porta 1
+                 *   dst_port == src  → drop: il destinatario è sulla porta
+                 *                      di ingresso (loop potenziale)
+                 *   dst_port == -1   → flood: manda a tutte le porte tranne src
+                 *                      ((1<<n_ports)-1) & ~(1<<src)
+                 *   altrimenti       → unicast: solo porta dst_port
                  *
-                 * Con 2 porte: "flood" = "manda a porta 1" = identico a forward.
-                 * Quindi droppare solo se dst_port == 0 (= stessa porta di ingresso).
+                 * Con 2 porte: flood e unicast verso l'altra porta coincidono.
+                 * Con N>2 porte: flood invia a N-1 TXQ, unicast a 1 sola.
                  */
-                int dst_port = mac_lookup(mac_table, dst_mac48);
-                fwd_decision[pkt_idx] = (dst_port != 0) ? 1u : 0u;
+                uint32_t egress_mask;
+                if (dst_port == src) {
+                    egress_mask = 0u;
+                } else if (dst_port < 0) {
+                    egress_mask = ((1u << kp.n_ports) - 1u) & ~(1u << src);
+                } else {
+                    egress_mask = (1u << dst_port);
+                }
+
+                /*
+                 * Per ogni porta di uscita q (bit settato in egress_mask):
+                 *
+                 * atomicAdd su next_wqe_slot[q]:
+                 *   Nel singolo warp (lockstep), l'atomicAdd è serializzata
+                 *   in lane-order. Ogni thread ottiene uno slot unico e
+                 *   consecutivo nel ring della TXQ q.
+                 *   Non serve prefix sum: il ring è circolare, non c'è
+                 *   bisogno di sapere quanti WQE ci sono stati prima.
+                 *
+                 * last_wqe_pkt_*[q]:
+                 *   Scrittura semplice (no atomic). Nel lockstep del warp,
+                 *   l'ultimo thread a scrivere per TXQ q ha anche lo slot
+                 *   più alto (perché l'atomicAdd assegna slot in lane-order
+                 *   e la scrittura segue immediatamente l'atomicAdd nella
+                 *   stessa "istruzione lockstep"). Vedere commento nel header.
+                 *
+                 * WQE zero-copy cross-port:
+                 *   Il WQE punta a pkt_addr nel buffer GPU della porta src.
+                 *   La NIC porta q legge direttamente dalla VRAM tramite PCIe.
+                 *   Nessuna copia: zero overhead di memoria.
+                 */
+                for (int q = 0; q < kp.n_ports; q++) {
+                    if (!(egress_mask & (1u << q)))
+                        continue;
+
+                    uint32_t mkey = kp.rxq_mkey_cross[src][q];
+                    uint32_t slot = atomicAdd(&next_wqe_slot[q], 1u);
+
+                    /* Last write wins: il thread con slot più alto scrive ultimo */
+                    last_wqe_pkt_addr[q]  = pkt_addr;
+                    last_wqe_pkt_bytes[q] = rx_attr[pkt_idx].bytes;
+                    last_wqe_pkt_mkey[q]  = mkey;
+
+                    struct doca_gpu_dev_eth_txq_wqe *wqe =
+                        doca_gpu_dev_eth_txq_get_wqe_ptr(
+                            kp.txq_gpu[q], wqe_base[q] + slot);
+                    doca_gpu_dev_eth_txq_wqe_prepare_send(
+                        kp.txq_gpu[q], wqe, wqe_base[q] + slot,
+                        pkt_addr, mkey, rx_attr[pkt_idx].bytes,
+                        DOCA_GPUNETIO_ETH_SEND_FLAG_NONE);
+                }
 
                 pkt_idx += blockDim.x;
             }
-            /*
-             * Barriera di sincronizzazione: aspetta che TUTTI i 32 thread
-             * abbiano finito di scrivere in fwd_decision[].
-             * Dopo questo punto, thread 0 può leggere tutte le decisioni.
-             */
+
+            /* Tutti i WQE sono stati scritti. */
             __syncthreads();
 
-            /* ============================================================
-             * FASE SERIALE — solo thread 0 riempie i WQE.
+            /* ==============================================================
+             * FASE 3: FIXUP NOTIFY + SUBMIT + POLL (solo thread 0)
              *
-             * Perché serial e non parallelo?
-             * I WQE sulla TXQ devono avere indici CONSECUTIVI senza buchi.
-             * Non sappiamo in anticipo quali pacchetti vengono droppati,
-             * quindi non possiamo pre-assegnare indici WQE in parallelo.
-             * Thread 0 fa due passaggi:
-             *   1. Conta quanti pacchetti vanno forwardati (n_to_forward)
-             *   2. Assegna WQE consecutivi: wqe_p1+0, wqe_p1+1, ..., wqe_p1+(n-1)
-             * ============================================================ */
+             * Per ogni TXQ q con WQE in questo batch:
+             *   a. next_wqe_slot[q] = n = numero totale di WQE per txq[q]
+             *   b. Ri-riempie l'ULTIMO WQE (indice wqe_base[q]+n-1) con NOTIFY.
+             *      La NIC genera una CQE SOLO per WQE con NOTIFY: invece di
+             *      una CQE per WQE (enorme overhead), otteniamo una CQE per batch.
+             *   c. doca_gpu_dev_eth_txq_submit: suona il doorbell → NIC inizia DMA
+             *   d. doca_gpu_dev_eth_txq_poll_completion_at: aspetta CQE
+             *   e. Aggiorna wqe_base[q] e cqe_idx[q] per il prossimo batch
+             *
+             * Con flooding a N porte, thread 0 fa N-1 submit+poll consecutivi.
+             * (Ottimizzazione futura: sottomettere tutti prima di pollare,
+             *  ma richiederebbe tracking separato dei doorbell. Non necessario ora.)
+             * ============================================================== */
             if (threadIdx.x == 0) {
-
-                /* Passaggio 1: conta i forward */
-                uint32_t n_to_forward = 0;
-                for (uint32_t i = 0; i < rx_pkt_count; i++) {
-                    if (fwd_decision[i])
-                        n_to_forward++;
-                }
-
-                if (n_to_forward > 0) {
-
-                    /* Passaggio 2: riempi WQE per ogni pacchetto forwardato */
-                    uint32_t wqe_offset = 0;
-                    for (uint32_t i = 0; i < rx_pkt_count; i++) {
-                        if (!fwd_decision[i])
-                            continue;
-
-                        /* Indirizzo del pacchetto in GPU memory di porta 0 */
-                        uint64_t pkt_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
-                            rxq_gpu_p0, rx_first_pkt_idx + i);
-
-                        /*
-                         * Flag NOTIFY: solo sull'ULTIMO WQE del batch.
-                         *
-                         * La NIC genera una CQE (Completion Queue Entry)
-                         * SOLO per i WQE con flag NOTIFY. Così invece di
-                         * ricevere una CQE per ogni dei 2048 pacchetti
-                         * (enorme overhead), ne riceviamo UNA per batch.
-                         * Questo è il pattern consigliato da NVIDIA.
-                         */
-                        enum doca_gpu_eth_send_flags flags =
-                            (wqe_offset == n_to_forward - 1) ?
-                                DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY :
-                                DOCA_GPUNETIO_ETH_SEND_FLAG_NONE;
-
-                        /*
-                         * ZERO-COPY CROSS-PORT WQE:
-                         *
-                         * Il WQE dice alla NIC porta 1:
-                         *   "Leggi rx_attr[i].bytes byte dall'indirizzo pkt_addr
-                         *    (che si trova nel buffer GPU della porta 0)
-                         *    usando il mkey rxq0_mkey_for_txq1,
-                         *    e trasmetti quei byte in rete."
-                         *
-                         * La NIC porta 1 accede alla memoria GPU della porta 0
-                         * via PCIe senza passare per la CPU. Zero copie.
-                         *
-                         * rxq0_mkey_for_txq1: il mkey ottenuto da
-                         *   doca_mmap_get_mkey(mmap_porta0, ddev_porta1)
-                         * È la chiave RDMA che autorizza la NIC porta 1 ad
-                         * accedere alla memoria GPU registrata per porta 0.
-                         */
-                        struct doca_gpu_dev_eth_txq_wqe *wqe =
-                            doca_gpu_dev_eth_txq_get_wqe_ptr(
-                                txq_gpu_p1, wqe_p1 + wqe_offset);
-
-                        doca_gpu_dev_eth_txq_wqe_prepare_send(
-                            txq_gpu_p1,
-                            wqe,
-                            wqe_p1 + wqe_offset,
-                            pkt_addr,
-                            rxq0_mkey_for_txq1,
-                            rx_attr[i].bytes,
-                            flags);
-
-                        wqe_offset++;
-                    }
+                for (int q = 0; q < kp.n_ports; q++) {
+                    uint32_t n = next_wqe_slot[q];
+                    if (n == 0)
+                        continue;
 
                     /*
-                     * SUBMIT (doorbell):
-                     * Scrive nell'UAR (User Access Region) della BF2 tramite PCIe.
-                     * Questo dice alla NIC porta 1 "ci sono nuovi WQE da processare
-                     * fino all'indice wqe_p1 + n_to_forward".
-                     * La NIC inizia immediatamente il DMA dalla GPU e la trasmissione.
+                     * Fixup: ri-riempie l'ultimo WQE (slot più alto) con NOTIFY.
+                     * last_wqe_pkt_*[q] contiene i dati del WQE con slot n-1
+                     * (garantito dalla proprietà "last write wins" nel warp).
                      */
-                    doca_gpu_dev_eth_txq_submit(txq_gpu_p1, wqe_p1 + n_to_forward);
+                    uint64_t last_slot = wqe_base[q] + n - 1;
+                    struct doca_gpu_dev_eth_txq_wqe *last_wqe =
+                        doca_gpu_dev_eth_txq_get_wqe_ptr(kp.txq_gpu[q], last_slot);
+                    doca_gpu_dev_eth_txq_wqe_prepare_send(
+                        kp.txq_gpu[q], last_wqe, last_slot,
+                        last_wqe_pkt_addr[q],
+                        last_wqe_pkt_mkey[q],
+                        last_wqe_pkt_bytes[q],
+                        DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY);
 
-                    /*
-                     * POLL COMPLETION (busy-wait):
-                     * Thread 0 legge in loop la CQE in GPU memory finché la NIC
-                     * la scrive (dopo aver processato il WQE con NOTIFY).
-                     *
-                     * RESOURCE_SHARING_MODE_GPU: la TXQ è condivisa solo in GPU.
-                     * SYNC_SCOPE_CTA: sincronizzazione a livello di blocco CUDA.
-                     * WAIT_FLAG_B: attesa bloccante (busy-wait finché CQE arriva).
-                     */
+                    /* Doorbell: dice alla NIC q "ci sono n WQE da processare" */
+                    doca_gpu_dev_eth_txq_submit(kp.txq_gpu[q], wqe_base[q] + n);
+
+                    /* Aspetta la CQE generata dal WQE con NOTIFY */
                     ret = doca_gpu_dev_eth_txq_poll_completion_at<
                             DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,
                             DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(
-                        txq_gpu_p1,
-                        cqe_p1,
+                        kp.txq_gpu[q], cqe_idx[q],
                         DOCA_GPUNETIO_ETH_WAIT_FLAG_B);
 
-                    if (ret != DOCA_SUCCESS)
-                        DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-
-                    wqe_p1  += n_to_forward;
-                    cqe_p1  += 1;
-                    tot_fwd += n_to_forward;
-                }
-            }
-            /* Aspetta thread 0 prima di riusare rx_attr e fwd_decision */
-            __syncthreads();
-        }
-
-        /* Controlla exit_cond prima di passare alla direzione B */
-        if (DOCA_GPUNETIO_VOLATILE(*exit_cond) != 0)
-            break;
-
-        /* ================================================================
-         * DIREZIONE B: PORTA 1 → PORTA 0
-         *
-         * Speculare alla direzione A, con porte invertite:
-         *   - ricezione da rxq1
-         *   - backward learning impara "src_mac è su porta 1"
-         *   - drop se dst_port == 1 (stessa porta di ingresso)
-         *   - forward su txq0 con mkey rxq1_mkey_for_txq0
-         * ================================================================ */
-
-        ret = doca_gpu_dev_eth_rxq_recv<
-                DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,
-                DOCA_GPUNETIO_ETH_MCST_AUTO,
-                DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,
-                DOCA_GPUNETIO_ETH_RX_ATTR_ALL>(
-            rxq_gpu_p1,
-            MAX_RX_NUM_PKTS,
-            MAX_RX_TIMEOUT_NS,
-            &rx_first_pkt_idx,
-            &rx_pkt_count,
-            rx_attr);
-
-        if (ret != DOCA_SUCCESS) {
-            if (threadIdx.x == 0)
-                DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-            break;
-        }
-
-        if (rx_pkt_count > 0) {
-
-            uint32_t pkt_idx = threadIdx.x;
-            while (pkt_idx < rx_pkt_count) {
-
-                uint64_t pkt_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
-                    rxq_gpu_p1, rx_first_pkt_idx + pkt_idx);
-                const uint8_t *eth = (const uint8_t *)(uintptr_t)pkt_addr;
-
-                uint64_t dst_mac48 = mac_to_u64(eth);
-                uint64_t src_mac48 = mac_to_u64(eth + 6);
-
-                /* Backward learning: il mittente è raggiungibile su porta 1 */
-                mac_learn(mac_table, src_mac48, 1);
-
-                /* FIB lookup: dove va il destinatario? */
-                int dst_port = mac_lookup(mac_table, dst_mac48);
-
-                /* Drop se dst è sulla stessa porta 1, forward altrimenti */
-                fwd_decision[pkt_idx] = (dst_port != 1) ? 1u : 0u;
-
-                pkt_idx += blockDim.x;
-            }
-            __syncthreads();
-
-            if (threadIdx.x == 0) {
-
-                uint32_t n_to_forward = 0;
-                for (uint32_t i = 0; i < rx_pkt_count; i++) {
-                    if (fwd_decision[i])
-                        n_to_forward++;
-                }
-
-                if (n_to_forward > 0) {
-
-                    uint32_t wqe_offset = 0;
-                    for (uint32_t i = 0; i < rx_pkt_count; i++) {
-                        if (!fwd_decision[i])
-                            continue;
-
-                        uint64_t pkt_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
-                            rxq_gpu_p1, rx_first_pkt_idx + i);
-
-                        enum doca_gpu_eth_send_flags flags =
-                            (wqe_offset == n_to_forward - 1) ?
-                                DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY :
-                                DOCA_GPUNETIO_ETH_SEND_FLAG_NONE;
-
-                        /* WQE zero-copy: txq0 legge dal buffer GPU di rxq1 */
-                        struct doca_gpu_dev_eth_txq_wqe *wqe =
-                            doca_gpu_dev_eth_txq_get_wqe_ptr(
-                                txq_gpu_p0, wqe_p0 + wqe_offset);
-
-                        doca_gpu_dev_eth_txq_wqe_prepare_send(
-                            txq_gpu_p0,
-                            wqe,
-                            wqe_p0 + wqe_offset,
-                            pkt_addr,
-                            rxq1_mkey_for_txq0,
-                            rx_attr[i].bytes,
-                            flags);
-
-                        wqe_offset++;
+                    if (ret != DOCA_SUCCESS) {
+                        DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) = 1;
+                        break;
                     }
 
-                    doca_gpu_dev_eth_txq_submit(txq_gpu_p0, wqe_p0 + n_to_forward);
-
-                    ret = doca_gpu_dev_eth_txq_poll_completion_at<
-                            DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,
-                            DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(
-                        txq_gpu_p0,
-                        cqe_p0,
-                        DOCA_GPUNETIO_ETH_WAIT_FLAG_B);
-
-                    if (ret != DOCA_SUCCESS)
-                        DOCA_GPUNETIO_VOLATILE(*exit_cond) = 1;
-
-                    wqe_p0  += n_to_forward;
-                    cqe_p0  += 1;
-                    tot_fwd += n_to_forward;
+                    wqe_base[q] += n;
+                    cqe_idx[q]  += 1;
+                    tot_fwd     += n;
                 }
             }
             __syncthreads();
-        }
 
-    } /* fine while loop principale */
+        } /* for src */
+
+    } /* while (!exit_cond) */
 
     /*
-     * Scrivi il contatore finale in CPU_GPU memory.
-     * __threadfence_system(): flush le cache L1/L2 della GPU attraverso
-     * il bus PCIe in modo che la CPU veda il valore aggiornato dopo
-     * cudaStreamSynchronize(). Senza questo, la CPU potrebbe leggere
-     * un valore stale dalla sua cache.
+     * Pubblica il contatore verso la CPU.
+     * __threadfence_system(): flush cache GPU attraverso PCIe.
+     * Necessario perché fwd_count è in CPU_GPU memory (pinned sul lato CPU);
+     * senza questo la CPU potrebbe leggere un valore stale dalla propria cache.
      */
     if (threadIdx.x == 0) {
-        *fwd_count = tot_fwd;
+        *kp.fwd_count = tot_fwd;
         __threadfence_system();
     }
 }
 
 /* =========================================================================
- * WRAPPER EXTERN "C" — chiamabile da codice C (gpu_bridge.c)
+ * WRAPPER EXTERN "C" — chiamabile da gpu_bridge.c (codice C)
  * =========================================================================
- * Il kernel CUDA ha C++ name mangling. extern "C" produce un simbolo
- * con nome C semplice, linkabile dal codice C compilato con gcc.
+ * Prende kp per puntatore (convenzione C), lo dereferenzia e passa la struct
+ * per valore al kernel CUDA. CUDA copia automaticamente i ~400 B in
+ * kernel parameter memory.
  */
 extern "C" {
 
@@ -660,7 +499,14 @@ doca_error_t kernel_launch_bridge(cudaStream_t stream,
     if (!kp || !kp->mac_table || !kp->exit_cond || !kp->fwd_count)
         return DOCA_ERROR_INVALID_VALUE;
 
-    /* Verifica che non ci siano errori CUDA pendenti dal setup precedente */
+    if (kp->n_ports < 2 || kp->n_ports > MAX_N_PORTS)
+        return DOCA_ERROR_INVALID_VALUE;
+
+    for (int i = 0; i < kp->n_ports; i++) {
+        if (!kp->rxq_gpu[i] || !kp->txq_gpu[i])
+            return DOCA_ERROR_INVALID_VALUE;
+    }
+
     cuda_ret = cudaGetLastError();
     if (cuda_ret != cudaSuccess) {
         fprintf(stderr, "CUDA error before kernel launch: %s\n",
@@ -668,25 +514,8 @@ doca_error_t kernel_launch_bridge(cudaStream_t stream,
         return DOCA_ERROR_BAD_STATE;
     }
 
-    /*
-     * Lancio del kernel: <<<1 blocco, 32 thread, 0 shared_mem dinamica, stream>>>
-     *
-     * 1 blocco: il kernel è persistente (gira per sempre su un solo blocco).
-     * 32 thread: esattamente 1 warp, richiesto da EXEC_SCOPE_BLOCK.
-     * 0: la shared memory è dichiarata staticamente con __shared__ nel kernel
-     *    (dimensione fissa a compile time, non serve specifica dinamica).
-     * stream: CUDA stream non-bloccante, il CPU continua mentre la GPU lavora.
-     */
-    bridge_kernel<<<1, BRIDGE_BLOCK_THREADS, 0, stream>>>(
-        kp->rxq_gpu[0],
-        kp->txq_gpu[0],
-        kp->rxq_gpu[1],
-        kp->txq_gpu[1],
-        kp->rxq_mkey_for_other[0],
-        kp->rxq_mkey_for_other[1],
-        kp->mac_table,
-        kp->exit_cond,
-        kp->fwd_count);
+    /* Passa la struct per valore: CUDA copia i ~400 B in parameter memory */
+    bridge_kernel<<<1, BRIDGE_BLOCK_THREADS, 0, stream>>>(*kp);
 
     cuda_ret = cudaGetLastError();
     if (cuda_ret != cudaSuccess) {
