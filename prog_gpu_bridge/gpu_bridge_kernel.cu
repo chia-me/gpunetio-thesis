@@ -367,6 +367,28 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                 batch_unicast = 0;
                 batch_drop    = 0;
                 rx_pkt_total_local[src] += rx_pkt_count;
+
+                /* DEBUG: un log per batch (non per pacchetto, per non saturare
+                 * il buffer printf del device) con src/dst MAC ed EtherType
+                 * del primo pacchetto del batch. Rimuovere dopo il debug. */
+                {
+                    uint64_t p0_addr = doca_gpu_dev_eth_rxq_get_pkt_addr(
+                        kp.rxq_gpu[src], rx_first_pkt_idx);
+                    const uint8_t *p0 = (const uint8_t *)(uintptr_t)p0_addr;
+                    uint16_t ethertype = ((uint16_t)p0[12] << 8) | p0[13];
+                    const char *proto =
+                        (ethertype == 0x0806) ? "ARP"  :
+                        (ethertype == 0x0800) ? "IPv4" :
+                        (ethertype == 0x86DD) ? "IPv6" :
+                        (ethertype == 0x88CC) ? "LLDP" :
+                        (ethertype <  0x0600)  ? "802.3/LLC" : "altro";
+                    printf("src=%d batch=%u pkt0: %02x:%02x:%02x:%02x:%02x:%02x -> "
+                           "%02x:%02x:%02x:%02x:%02x:%02x  ethertype=0x%04x (%s)\n",
+                           src, rx_pkt_count,
+                           p0[6], p0[7], p0[8], p0[9], p0[10], p0[11],
+                           p0[0], p0[1], p0[2], p0[3], p0[4], p0[5],
+                           ethertype, proto);
+                }
             }
             __syncthreads();
 
