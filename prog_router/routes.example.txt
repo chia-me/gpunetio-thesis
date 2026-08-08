@@ -1,0 +1,27 @@
+# routes.example.txt — esempio di file di rotte statiche per gpu_router
+#
+# Formato (un campo whitespace-separated per colonna):
+#   <rete>/<prefisso>   <porta_uscita>   <mac_next_hop>
+#
+# - <rete>/<prefisso>: rete di destinazione in notazione CIDR.
+#     0.0.0.0/0 è la default route (matcha qualunque IP, priorità più
+#     bassa: viene scelta solo se nessuna rotta più specifica combacia).
+# - <porta_uscita>: indice di porta del router, 0..n_ports-1, nello stesso
+#     ordine in cui le hai passate con i flag -n sulla command line
+#     (quindi il primo -n è la porta 0, il secondo -n la porta 1, ecc.).
+# - <mac_next_hop>: MAC address a cui riscrivere il pacchetto in uscita.
+#     Questo router NON fa ARP: è l'equivalente di una voce ARP statica
+#     permanente. Deve essere il MAC del prossimo salto reale collegato
+#     a quella porta (un altro router, oppure l'host finale se la rotta
+#     descrive una rete direttamente connessa).
+#
+# Righe vuote e righe che iniziano con '#' vengono ignorate.
+#
+# Esempio con 2 porte (topologia di test: BF2 in modalità NIC con le due
+# porte fisiche ad:00.0 = porta 0 e ad:00.1 = porta 1):
+
+10.0.0.0/24   0   aa:bb:cc:dd:ee:01
+10.0.1.0/24   1   aa:bb:cc:dd:ee:02
+
+# Default route: tutto il resto esce dalla porta 1 verso un gateway upstream.
+0.0.0.0/0     1   aa:bb:cc:dd:ee:ff
