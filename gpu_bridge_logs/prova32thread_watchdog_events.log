@@ -1,0 +1,4 @@
+2026-08-08 17:36:37 avvio gpu_bridge
+2026-08-08 17:36:37 gpu_bridge PID=242179
+2026-08-08 17:41:17 uscita richiesta, fermo gpu_bridge
+2026-08-08 17:41:17 SIGTERM a PID=242179

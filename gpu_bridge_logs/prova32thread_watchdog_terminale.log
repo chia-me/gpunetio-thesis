@@ -1,0 +1,8 @@
+[watchdog] prova: prova32thread
+[watchdog] log gpu_bridge: /home/prognose/gpu_bridge_logs/prova32thread_gpu_bridge_live.log
+[watchdog] 15:00:32 avvio gpu_bridge...
+[watchdog] gpu_bridge avviato, PID=177081
+[watchdog] monitoraggio avviato — freeze = NIC riceve pacchetti (contatore hardware sale) MA gpu_bridge non li conta piu' (soglia 5s)
+[watchdog] 15:00:37 stato: NIC rx_phy=3189556602  bridge rx_tot=6
+[watchdog] 15:00:42 stato: NIC rx_phy=3189556603  bridge rx_tot=8
+[watchdog] 15:00:47 stato: NIC rx_phy=3189556606  bridge rx_tot=14

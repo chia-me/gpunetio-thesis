@@ -93,7 +93,7 @@
  * UNA porta di destinazione, quindi vede una frazione del traffico rispetto
  * a v1: 1024 resta ampiamente conservativo.
  */
-#define MAX_SQ_DESCR_NUM  1024
+#define MAX_SQ_DESCR_NUM  2048
 
 /* =========================================================================
  * COSTANTI — DOCA FLOW
@@ -103,14 +103,27 @@
 
 /*
  * RSS_HASH_FIELDS: campi usati dalla NIC per l'hash Toeplitz che sceglie
- * la coda RX. Copre tutto il traffico IPv4/IPv6 con o senza porte L4.
+ * la coda RX. Copre il traffico IPv4/UDP (quello del profilo di test
+ * gpu_bridge_rss_stress.py).
+ *
+ * NON combinare qui più di un flag L3 (IPV4/IPV6) o più di un flag L4
+ * (UDP/TCP) insieme: in TUTTI i sample e le applicazioni ufficiali DOCA che
+ * usano RSS multi-coda (grep su .../doca/samples e .../doca/applications),
+ * senza eccezioni, outer_flags è sempre "un solo L3 + un solo L4" (es.
+ * IPV4|UDP oppure IPV4|TCP). Combinare IPV4|IPV6|UDP|TCP insieme su
+ * un'unica pipe (come in una versione precedente di questo file) fa
+ * fallire doca_flow_pipe_create con DOCA_ERROR_INVALID_VALUE. Per bilanciare
+ * anche TCP e/o IPv6, serve una pipe RSS separata per combinazione,
+ * incatenata dietro una pipe di classificazione — vedi il sample ufficiale
+ * applications/gpu_packet_processing/config_queues/flow.c per il pattern.
+ *
  * Il traffico L2 puro (ARP, ecc. — nessun header IP) NON ha campi su cui
  * fare hash: DOCA Flow/la NIC lo instrada su una coda fissa (tipicamente
  * la 0). È un limite hardware, non del nostro codice: la struttura
  * doca_rss_type non espone alcun campo di hash sui MAC L2.
  */
 #define RSS_HASH_FIELDS \
-    (DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_IPV6 | DOCA_FLOW_RSS_UDP | DOCA_FLOW_RSS_TCP)
+    (DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_UDP)
 
 /* =========================================================================
  * COSTANTI — CUDA KERNEL
@@ -238,6 +251,12 @@ struct bridge_kernel_params {
     /* ── Diagnostica live (CPU_GPU), aggregata con atomicAdd da tutti i
      * blocchi una volta per ogni batch ricevuto (non per pacchetto). ──── */
     uint64_t *rx_pkt_total;   /* [n_ports] */
+    /* rx_pkt_per_queue[p*n_queues+q]: pacchetti ricevuti dalla singola coda
+     * (p,q). Serve SOLO a verificare che l'RSS hardware stia davvero
+     * distribuendo il traffico su tutte le code (le RXQ DOCA GPUNetIO sono
+     * code raw DevX: non compaiono in "ethtool -S", questo è l'unico modo
+     * di osservarle). Indice = blockIdx.x, stesso ordine di kp.queues. */
+    uint64_t *rx_pkt_per_queue; /* [n_ports * n_queues] */
     uint64_t *flood_count;
     uint64_t *unicast_count;
     uint64_t *drop_count;

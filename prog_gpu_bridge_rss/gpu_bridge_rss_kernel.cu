@@ -352,6 +352,8 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
              * e tutte quelle precedenti (incluso mac_learn sul flap_ring). */
             atomicAdd((unsigned long long *)&kp.rx_pkt_total[ctx.port],
                       (unsigned long long)rx_pkt_count);
+            atomicAdd((unsigned long long *)&kp.rx_pkt_per_queue[blockIdx.x],
+                      (unsigned long long)rx_pkt_count);
             atomicAdd((unsigned long long *)kp.flood_count,   (unsigned long long)batch_flood);
             atomicAdd((unsigned long long *)kp.unicast_count, (unsigned long long)batch_unicast);
             atomicAdd((unsigned long long *)kp.drop_count,    (unsigned long long)batch_drop);
@@ -376,8 +378,8 @@ doca_error_t kernel_launch_bridge(cudaStream_t stream,
     if (!kp || !kp->mac_table || !kp->exit_cond || !kp->fwd_count || !kp->queues)
         return DOCA_ERROR_INVALID_VALUE;
 
-    if (!kp->rx_pkt_total || !kp->flood_count || !kp->unicast_count ||
-        !kp->drop_count || !kp->flap_ring || !kp->flap_ring_head)
+    if (!kp->rx_pkt_total || !kp->rx_pkt_per_queue || !kp->flood_count ||
+        !kp->unicast_count || !kp->drop_count || !kp->flap_ring || !kp->flap_ring_head)
         return DOCA_ERROR_INVALID_VALUE;
 
     if (kp->n_ports < 2 || kp->n_ports > MAX_N_PORTS)

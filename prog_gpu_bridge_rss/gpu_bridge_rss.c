@@ -4,7 +4,7 @@
  *
  * Differenze principali rispetto a prog_gpu_bridge (v1):
  *   - Ogni porta ha N_QUEUES_PER_PORT code RX, bilanciate dall'hardware
- *     tramite RSS (hash su IPv4/IPv6/UDP/TCP, vedi RSS_HASH_FIELDS).
+ *     tramite RSS (hash su IPv4/UDP, vedi RSS_HASH_FIELDS).
  *   - Ogni coppia (porta sorgente, coda) ha un set PRIVATO di TXQ verso
  *     ogni altra porta di destinazione — nessuna TXQ è mai condivisa tra
  *     due blocchi CUDA diversi (vedi gpu_bridge_rss.h e il kernel per il
@@ -140,8 +140,16 @@ static doca_error_t flow_global_init(void)
     res = doca_flow_cfg_create(&cfg);
     if (res != DOCA_SUCCESS) return res;
 
-    doca_flow_cfg_set_pipe_queues(cfg, 1);
-    doca_flow_cfg_set_mode_args(cfg, "vnf");
+    /* Deve coprire tutti gli id di coda RSS usati (0..N_QUEUES_PER_PORT-1):
+     * con 1 sola coda (come in v1) DOCA Flow valida la pipe RSS multi-coda
+     * contro questo numero e rifiuta con "Invalid input" se è troppo basso. */
+    doca_flow_cfg_set_pipe_queues(cfg, N_QUEUES_PER_PORT);
+    /* "hws" (Hardware Steering) è richiesto per RSS multi-coda: TUTTI i
+     * sample/applicazioni DOCA con fwd.rss.nr_queues > 1 usano "vnf,hws" o
+     * "switch,hws", mai "vnf" da solo (che basta solo per nr_queues == 1,
+     * come in v1). Senza "hws" doca_flow_pipe_create fallisce con
+     * DOCA_ERROR_INVALID_VALUE. */
+    doca_flow_cfg_set_mode_args(cfg, "vnf,hws");
     doca_flow_cfg_set_nr_counters(cfg, FLOW_NB_COUNTERS);
 
     res = doca_flow_init(cfg);
@@ -446,7 +454,7 @@ static doca_error_t setup_port_flow(struct bridge_port *port, const char *label)
         rss_queues[q] = (uint16_t)q;
     }
 
-    /* RSS su tutte le N_QUEUES_PER_PORT code, hash su IPv4/IPv6/UDP/TCP.
+    /* RSS su tutte le N_QUEUES_PER_PORT code, hash su IPv4/UDP.
      * Traffico non-IP (ARP, ecc.) non ha campi su cui la NIC possa fare
      * hash: finisce su una coda fissa (vedi RSS_HASH_FIELDS in header). */
     fwd.type             = DOCA_FLOW_FWD_RSS;
@@ -510,6 +518,7 @@ static void cleanup_all(struct bridge_port      *ports,
                          uint32_t                *gpu_exit,
                          uint64_t                *gpu_fwd,
                          uint64_t                *gpu_rx_total,
+                         uint64_t                *gpu_rx_per_queue,
                          uint64_t                *gpu_flood,
                          uint64_t                *gpu_unicast,
                          uint64_t                *gpu_drop,
@@ -526,6 +535,7 @@ static void cleanup_all(struct bridge_port      *ports,
     if (gpu_fwd  && gdev) doca_gpu_mem_free(gdev, gpu_fwd);
 
     if (gpu_rx_total && gdev) doca_gpu_mem_free(gdev, gpu_rx_total);
+    if (gpu_rx_per_queue && gdev) doca_gpu_mem_free(gdev, gpu_rx_per_queue);
     if (gpu_flood    && gdev) doca_gpu_mem_free(gdev, gpu_flood);
     if (gpu_unicast  && gdev) doca_gpu_mem_free(gdev, gpu_unicast);
     if (gpu_drop     && gdev) doca_gpu_mem_free(gdev, gpu_drop);
@@ -646,6 +656,8 @@ int main(int argc, char *argv[])
     uint64_t             *cpu_fwd      = NULL;
     uint64_t             *gpu_rx_total = NULL;
     uint64_t             *cpu_rx_total = NULL;
+    uint64_t             *gpu_rx_per_queue = NULL;
+    uint64_t             *cpu_rx_per_queue = NULL;
     uint64_t             *gpu_flood    = NULL;
     uint64_t             *cpu_flood    = NULL;
     uint64_t             *gpu_unicast  = NULL;
@@ -770,6 +782,15 @@ int main(int argc, char *argv[])
     }
     memset(cpu_rx_total, 0, (size_t)n_ports * sizeof(uint64_t));
 
+    res = doca_gpu_mem_alloc(gdev, (size_t)(n_ports * N_QUEUES_PER_PORT) * sizeof(uint64_t),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_rx_per_queue, (void **)&cpu_rx_per_queue);
+    if (res != DOCA_SUCCESS || !gpu_rx_per_queue) {
+        fprintf(stderr, "alloc rx_pkt_per_queue: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_rx_per_queue, 0, (size_t)(n_ports * N_QUEUES_PER_PORT) * sizeof(uint64_t));
+
     res = doca_gpu_mem_alloc(gdev, sizeof(uint64_t), system_page_size(),
                               DOCA_GPU_MEM_TYPE_CPU_GPU,
                               (void **)&gpu_flood, (void **)&cpu_flood);
@@ -863,7 +884,8 @@ int main(int argc, char *argv[])
     kp.exit_cond = gpu_exit;
     kp.fwd_count = gpu_fwd;
 
-    kp.rx_pkt_total   = gpu_rx_total;
+    kp.rx_pkt_total     = gpu_rx_total;
+    kp.rx_pkt_per_queue = gpu_rx_per_queue;
     kp.flood_count    = gpu_flood;
     kp.unicast_count  = gpu_unicast;
     kp.drop_count     = gpu_drop;
@@ -895,8 +917,10 @@ int main(int argc, char *argv[])
      * a __threadfence_system() lato GPU — nessuna sync/memcpy richiesta qui. */
     {
         uint32_t last_flap_head = 0;
+        uint32_t tick = 0;
         while (!DOCA_GPUNETIO_VOLATILE(g_force_quit)) {
             usleep(500000);
+            tick++;
 
             uint64_t rx_sum = 0;
             for (int p = 0; p < n_ports; p++)
@@ -907,6 +931,34 @@ int main(int argc, char *argv[])
                 printf("porta%d=%lu%s", p, cpu_rx_total[p], p + 1 < n_ports ? " " : "");
             printf(")  fwd=%lu  flood=%lu  unicast=%lu  drop=%lu  mac_flaps=%u\n",
                    *cpu_fwd, *cpu_flood, *cpu_unicast, *cpu_drop, *cpu_flap_head);
+
+            /* Diagnostica RSS: quante delle N_QUEUES_PER_PORT code per porta
+             * hanno ricevuto almeno un pacchetto. Se resta a 1 con traffico
+             * variato, l'hash non sta distribuendo (vedi rss_hash_check.py). */
+            printf("[rss]  code attive: ");
+            for (int p = 0; p < n_ports; p++) {
+                int active = 0;
+                uint64_t qmin = UINT64_MAX, qmax = 0;
+                for (int q = 0; q < N_QUEUES_PER_PORT; q++) {
+                    uint64_t c = cpu_rx_per_queue[p * N_QUEUES_PER_PORT + q];
+                    if (c > 0) active++;
+                    if (c < qmin) qmin = c;
+                    if (c > qmax) qmax = c;
+                }
+                printf("porta%d=%d/%d(min=%lu,max=%lu)%s", p, active, N_QUEUES_PER_PORT,
+                       qmin, qmax, p + 1 < n_ports ? "  " : "");
+            }
+            printf("\n");
+
+            /* Dump completo per coda ogni ~5s (10 tick da 500ms), a richiesta */
+            if (tick % 10 == 0) {
+                for (int p = 0; p < n_ports; p++) {
+                    printf("  porta%d: ", p);
+                    for (int q = 0; q < N_QUEUES_PER_PORT; q++)
+                        printf("[%d]=%lu ", q, cpu_rx_per_queue[p * N_QUEUES_PER_PORT + q]);
+                    printf("\n");
+                }
+            }
 
             uint32_t head = *cpu_flap_head;
             uint32_t new_flaps = head - last_flap_head;
@@ -943,7 +995,7 @@ int main(int argc, char *argv[])
 cleanup:
     cleanup_all(ports, n_ports, txq, gdev, gpu_queues, mac_table_gpu,
                 gpu_exit, gpu_fwd,
-                gpu_rx_total, gpu_flood, gpu_unicast, gpu_drop,
+                gpu_rx_total, gpu_rx_per_queue, gpu_flood, gpu_unicast, gpu_drop,
                 gpu_flap_ring, gpu_flap_head,
                 stream, flow_inited);
     printf("Done.\n");

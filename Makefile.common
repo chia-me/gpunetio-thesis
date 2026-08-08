@@ -30,7 +30,9 @@ CFLAGS := -O2 -Wall -Wno-missing-braces $(DEFINES) \
 # ── Flag CUDA (file .cu) ───────────────────────────────────────────────────
 # -rdc=true: relocatable device code, necessario per libdoca_gpunetio_device.a
 # -gencode: genera codice per sm_75 sm_80 sm_86 sm_90 in un unico binario
-NVFLAGS := -O2 $(DEFINES) \
+# -lineinfo: tabella riga sorgente <-> PC per cuda-gdb/nsight, NON disabilita
+#   le ottimizzazioni (a differenza di -G) — costo runtime trascurabile.
+NVFLAGS := -O2 -lineinfo $(DEFINES) \
            -I$(DOCA_INC) -I$(CUDA_INC) \
            -forward-unknown-to-host-compiler \
            -rdc=true \

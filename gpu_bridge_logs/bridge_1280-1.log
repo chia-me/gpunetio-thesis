@@ -1,0 +1,144 @@
+/opt/trex/v3.08/external_libs/scapy-2.4.3/scapy/layers/ipsec.py:469: CryptographyDeprecationWarning: Blowfish has been deprecated
+  cipher=algorithms.Blowfish,
+/opt/trex/v3.08/external_libs/scapy-2.4.3/scapy/layers/ipsec.py:483: CryptographyDeprecationWarning: CAST5 has been deprecated
+  cipher=algorithms.CAST5,
+/opt/trex/v3.08/automation/trex_control_plane/interactive/trex/examples/stl/stl_ndr_bench_tool.py:122: SyntaxWarning: invalid escape sequence '\S'
+  m = re.search('(\S+)=(.+)', token)
+/opt/trex/v3.08/automation/trex_control_plane/interactive/trex/examples/stl/stl_ndr_bench_tool.py:229: SyntaxWarning: invalid escape sequence '\T'
+  parser.add_argument('--yaml', dest='yaml', help='use YAML file for configurations, use --yaml PATH\TO\YAML.yaml',
+
+
+Status                            :Calculation of max rate for DUT
+
+Title                             :gpu_bridge_stress
+Running Rate                      :98.3 Gbps
+Running Rate (% of max)           :100.00 %
+Max Rate                          :98.3 Gbps       
+Drop Rate                         :84.34515 % of oPackets
+Queue Full                        :9.07 % of oPackets
+Elapsed Time                      :35.03 seconds
+BW Per Core                       :197.98 Gbit/Sec @100% per core
+TX PPS uni-directional            :9.6 MPPS
+RX PPS uni-directional            :1.48 MPPS
+TX Utilization                    :99.84 %
+TRex CPU                          :99.31 %
+Total TX L1 uni-directional       :99.84 Gbps     
+Total RX L1 uni-directional       :15.42 Gbps     
+Total TX L2 uni-directional       :98.3 Gbps     
+Total RX L2 uni-directional       :15.18 Gbps     
+
+
+Status                            :Drops happened, searching for NDR with optimized binary search
+
+
+Status                            :Trying upper bound of assumed rate!
+
+Title                             :gpu_bridge_stress
+Iteration                         :Upper bound of assumed NDR
+Running Rate                      :16.15 Gbps
+Running Rate (% of max)           :16.44 %
+Max Rate                          :98.3 Gbps       
+Drop Rate                         :11.49316 % of oPackets
+Queue Full                        :0.00 % of oPackets
+Elapsed Time                      :70.06 seconds
+BW Per Core                       :2749.37 Gbit/Sec @100% per core
+TX PPS uni-directional            :1.58 MPPS
+RX PPS uni-directional            :1.4 MPPS
+TX Utilization                    :16.41 %
+TRex CPU                          :1.18 %
+Total TX L1 uni-directional       :16.41 Gbps     
+Total RX L1 uni-directional       :14.53 Gbps     
+Total TX L2 uni-directional       :16.15 Gbps     
+Total RX L2 uni-directional       :14.3 Gbps     
+
+
+Status                            :Trying lower bound of assumed rate!
+
+Title                             :gpu_bridge_stress
+Iteration                         :Lower bound of assumed NDR
+Running Rate                      :14.6 Gbps
+Running Rate (% of max)           :14.87 %
+Max Rate                          :98.3 Gbps       
+Drop Rate                         :0.00783 % of oPackets
+Queue Full                        :0.00 % of oPackets
+Elapsed Time                      :105.09 seconds
+BW Per Core                       :2893.63 Gbit/Sec @100% per core
+TX PPS uni-directional            :1.43 MPPS
+RX PPS uni-directional            :1.43 MPPS
+TX Utilization                    :14.83 %
+TRex CPU                          :1.01 %
+Total TX L1 uni-directional       :14.83 Gbps     
+Total RX L1 uni-directional       :14.83 Gbps     
+Total TX L2 uni-directional       :14.6 Gbps     
+Total RX L2 uni-directional       :14.6 Gbps     
+
+
+Status                            :Lower bound of assumed NDR drops are below desired rate :)
+Interval                          :[14,16]
+
+
+Status                            :Drops beyond Desired rate occurred
+Interval                          :[14,16]
+
+Title                             :gpu_bridge_stress
+Iteration                         :0
+Running Rate                      :15.37 Gbps
+Running Rate (% of max)           :15.65 %
+Max Rate                          :98.3 Gbps       
+Drop Rate                         :6.31410 % of oPackets
+Queue Full                        :0.00 % of oPackets
+Elapsed Time                      :35.03 seconds
+BW Per Core                       :2839.34 Gbit/Sec @100% per core
+TX PPS uni-directional            :1.5 MPPS
+RX PPS uni-directional            :1.41 MPPS
+TX Utilization                    :15.61 %
+TRex CPU                          :1.08 %
+Total TX L1 uni-directional       :15.61 Gbps     
+Total RX L1 uni-directional       :14.63 Gbps     
+Total TX L2 uni-directional       :15.37 Gbps     
+Total RX L2 uni-directional       :14.4 Gbps     
+Distance from current Optimum     :0.78 %
+
+Title                             :gpu_bridge_stress
+Total Iterations                  :3
+Max Rate                          :98.3 Gbps       
+Optimal P-Drop Rate               :14.6 Gbps
+P-Drop Rate (% of max)            :14.87 %
+Drop Rate at Optimal P-Drop Rate  :0.00783 % of oPackets
+Queue Full at Optimal P-Drop Rate :0.00 % of oPackets
+Elapsed Time                      :140.13 seconds
+BW Per Core                       :2893.63 Gbit/Sec @100% per core
+TX PPS uni-directional            :1.43 MPPS
+RX PPS uni-directional            :1.43 MPPS
+TX Utilization                    :14.83 %
+TRex CPU                          :1.01 %
+Total TX L1 uni-directional       :14.83 Gbps     
+Total RX L1 uni-directional       :14.83 Gbps     
+Total TX L2 uni-directional       :14.6 Gbps     
+Total RX L2 uni-directional       :14.6 Gbps     
+Distance from current Optimum     :0.00 %
+NDR(s) uni-directional            :14.6 Gbps 
+
+Bench Run has finished :-)
+
+{'BW per core [Gbit/sec @100% per core]': '2893.63Gbit/Sec @100% per core',
+ 'CPU Utilization [%]': '1.01',
+ 'Drop Rate [%]': '0.01',
+ 'Elapsed Time [Sec]': '140.13',
+ 'Line Utilization [%]': '14.83',
+ 'Max Rate [bps]': '98.3 Gbps',
+ 'NDR points': ['14.6 Gbps'],
+ 'OPT RX Rate [bps]': '14.6 Gbps',
+ 'OPT Rate (Multiplier) [%]': '14.872105336441255',
+ 'OPT TX Rate [bps]': '14.6 Gbps',
+ 'Queue Full [%]': '0.0%',
+ 'RX [MPPS]': '1.43 MPPS',
+ 'RX [bps]': '14.6 Gbps',
+ 'TX [MPPS]': '1.43 MPPS',
+ 'TX [bps]': '14.6 Gbps',
+ 'Title': 'gpu_bridge_stress',
+ 'Total Iterations': 0,
+ 'Total RX L1': '14.83 Gbps',
+ 'Total TX L1': '14.83 Gbps',
+ 'latency': {},
+ 'valid_latency': True}
