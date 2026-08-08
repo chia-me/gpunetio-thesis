@@ -245,10 +245,13 @@ static __device__ int mac_lookup(const uint64_t *mac_table, uint64_t mac48)
  *     Thread 0 lo usa dopo __syncthreads() per ri-riempire l'ultimo
  *     WQE con flag NOTIFY (fixup prima del submit).
  *
- * VARIABILI PRIVATE DI THREAD 0 (solo usate in Fase 3):
- *   wqe_base[MAX_N_PORTS]: prossimo indice WQE per ogni TXQ (persistente tra batch)
+ * VARIABILI PRIVATE DI THREAD 0 (scritte solo in Fase 3, mai lette da altri thread):
  *   cqe_idx[MAX_N_PORTS]:  prossimo indice CQE per ogni TXQ (persistente tra batch)
  *   tot_fwd:               totale pacchetti inoltrati
+ *
+ * wqe_base[MAX_N_PORTS] NON è privata di thread 0: è __shared__ perché letta
+ * da tutti i thread in Fase 2B (vedi il commento alla sua dichiarazione più
+ * sotto per il motivo esatto).
  */
 __global__ void bridge_kernel(struct bridge_kernel_params kp)
 {
@@ -303,6 +306,13 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
     uint64_t cqe_idx[MAX_N_PORTS];
     uint64_t tot_fwd = 0;
 
+    /* batch_round[q]: contatore REALE di batch completati con successo per
+     * la TXQ q. Cresce di 1 esattamente insieme a cqe_idx[q], mai stimato
+     * a posteriori dal volume di pacchetti (che dipende dalla dimensione
+     * variabile dei batch). Serve a rispondere empiricamente alla domanda
+     * "a quale round esatto si blocca il freeze, ed è sempre lo stesso?". */
+    uint64_t batch_round[MAX_N_PORTS];
+
     /* Contatori diagnostici persistenti (solo thread 0, come tot_fwd) */
     uint64_t rx_pkt_total_local[MAX_N_PORTS];
     uint64_t flood_total = 0, unicast_total = 0, drop_total = 0;
@@ -311,11 +321,25 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
 
     if (threadIdx.x == 0) {
         for (int q = 0; q < MAX_N_PORTS; q++) {
-            wqe_base[q] = 0;
-            cqe_idx[q]  = 0;
+            wqe_base[q]    = 0;
+            cqe_idx[q]     = 0;
+            batch_round[q] = 0;
         }
         for (int q = 0; q < MAX_N_PORTS; q++)
             rx_pkt_total_local[q] = 0;
+
+        /* DEBUG: dimensione REALE della CQ/SQ secondo la libreria, letta una
+         * sola volta all'avvio direttamente dai campi pubblici della struct
+         * doca_gpu_eth_txq (cqe_num/cqe_mask/wqe_mask) — non assunta uguale
+         * a MAX_SQ_DESCR_NUM. Rimuovere dopo il debug. */
+        for (int q = 0; q < kp.n_ports; q++) {
+            uint32_t cqe_num_dbg  = kp.txq_gpu[q]->cqe_num;
+            uint32_t cqe_mask_dbg = kp.txq_gpu[q]->cqe_mask;
+            uint16_t wqe_mask_dbg = kp.txq_gpu[q]->wqe_mask;
+            printf("[TXQ INFO] q=%d cqe_num=%u cqe_mask=0x%x (%u) wqe_mask=0x%x (%u)\n",
+                   q, cqe_num_dbg, cqe_mask_dbg, cqe_mask_dbg,
+                   wqe_mask_dbg, wqe_mask_dbg);
+        }
     }
     __syncthreads();
 
@@ -549,24 +573,79 @@ __global__ void bridge_kernel(struct bridge_kernel_params kp)
                         last_pkt_bytes,
                         DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY);
 
+                    /* DEBUG: pubblica wqe_base[q] e batch_round[q] PRIMA del
+                     * submit/poll, non nel flush di fine giro — se il poll
+                     * va in timeout, questo è l'unico modo per sapere a
+                     * quale indice WQE (posizione nel ring = wqe_base %
+                     * MAX_SQ_DESCR_NUM) e a quale round esatto il kernel è
+                     * rimasto fermo. batch_round[q] è il conteggio REALE di
+                     * round riusciti finora per questa coda — il round
+                     * bloccato, se capita, è batch_round_dbg[q]+1. */
+                    kp.wqe_base_dbg[q]    = wqe_base[q];
+                    kp.batch_round_dbg[q] = batch_round[q];
+                    __threadfence_system();
+
                     /* Doorbell: dice alla NIC q "ci sono n WQE da processare" */
                     doca_gpu_dev_eth_txq_submit(kp.txq_gpu[q], wqe_base[q] + n);
 
-                    /* Aspetta la CQE generata dal WQE con NOTIFY */
-                    ret = doca_gpu_dev_eth_txq_poll_completion_at<
-                            DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,
-                            DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(
-                        kp.txq_gpu[q], cqe_idx[q],
-                        DOCA_GPUNETIO_ETH_WAIT_FLAG_B);
+                    /* DEBUG: pubblicato SUBITO DOPO che submit() è tornato,
+                     * PRIMA di iniziare il poll. Se al freeze wqe_base_dbg è
+                     * fresco ma questo è rimasto al valore del round
+                     * precedente, il blocco è dentro submit() stesso (es.
+                     * nello spinlock interno), non nel poll che segue. */
+                    kp.submit_done_dbg[q] = batch_round[q];
+                    __threadfence_system();
 
-                    if (ret != DOCA_SUCCESS) {
-                        DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) = 1;
-                        break;
+                    /* Aspetta la CQE generata dal WQE con NOTIFY, con timeout
+                     * esplicito. WAIT_FLAG_B non ha alcun timeout interno: se
+                     * il completamento atteso non arriva mai resta bloccato
+                     * per sempre, senza lasciare traccia diagnostica. Usiamo
+                     * invece WAIT_FLAG_NB (un solo controllo, non bloccante)
+                     * dentro un ciclo limitato nostro. La funzione non espone
+                     * un flag "completato" in modalità NB (ritorna sempre
+                     * DOCA_SUCCESS sia che trovi la CQE sia che non trovi
+                     * nulla), quindi rileviamo il vero completamento
+                     * leggendo direttamente txq->cqe_ci — campo pubblico
+                     * della struct (non un dettaglio interno nascosto),
+                     * aggiornato via submit_cq_dbr SOLO quando la CQE è
+                     * stata davvero confermata. */
+                    {
+                        uint32_t poll_iter;
+
+                        for (poll_iter = 0; poll_iter < POLL_NB_TIMEOUT_ITERS; poll_iter++) {
+                            ret = doca_gpu_dev_eth_txq_poll_completion_at<
+                                    DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,
+                                    DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(
+                                kp.txq_gpu[q], cqe_idx[q],
+                                DOCA_GPUNETIO_ETH_WAIT_FLAG_NB);
+
+                            if (ret != DOCA_SUCCESS)
+                                break; /* CQE di errore reale (REQ_ERR) */
+
+                            if (DOCA_GPUNETIO_VOLATILE(kp.txq_gpu[q]->cqe_ci) > cqe_idx[q])
+                                break; /* completata in questo giro NB */
+                        }
+
+                        if (ret != DOCA_SUCCESS || poll_iter == POLL_NB_TIMEOUT_ITERS) {
+                            printf("[FREEZE] q=%d src=%d: CQE mai arrivata dopo %u "
+                                   "check NB — wqe_base=%llu (ring_pos=%llu) "
+                                   "cqe_idx=%llu batch_round=%llu n_wqe_batch=%u "
+                                   "ret=%d\n",
+                                   q, src, POLL_NB_TIMEOUT_ITERS,
+                                   (unsigned long long)wqe_base[q],
+                                   (unsigned long long)(wqe_base[q] % MAX_SQ_DESCR_NUM),
+                                   (unsigned long long)cqe_idx[q],
+                                   (unsigned long long)batch_round[q],
+                                   n, (int)ret);
+                            DOCA_GPUNETIO_VOLATILE(*kp.exit_cond) = 1;
+                            break;
+                        }
                     }
 
-                    wqe_base[q] += n;
-                    cqe_idx[q]  += 1;
-                    tot_fwd     += n;
+                    wqe_base[q]    += n;
+                    cqe_idx[q]     += 1;
+                    batch_round[q] += 1;
+                    tot_fwd        += n;
                 }
 
                 /* Consolida i contatori diagnostici del batch nei totali persistenti. */
@@ -633,7 +712,8 @@ doca_error_t kernel_launch_bridge(cudaStream_t stream,
         return DOCA_ERROR_INVALID_VALUE;
 
     if (!kp->rx_pkt_total || !kp->flood_count || !kp->unicast_count ||
-        !kp->drop_count || !kp->flap_ring || !kp->flap_ring_head)
+        !kp->drop_count || !kp->flap_ring || !kp->flap_ring_head ||
+        !kp->wqe_base_dbg || !kp->batch_round_dbg || !kp->submit_done_dbg)
         return DOCA_ERROR_INVALID_VALUE;
 
     if (kp->n_ports < 2 || kp->n_ports > MAX_N_PORTS)

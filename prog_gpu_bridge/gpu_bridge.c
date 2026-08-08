@@ -590,6 +590,9 @@ static void cleanup_all(struct bridge_port *ports,
                          uint64_t           *gpu_drop,
                          struct mac_flap_record *gpu_flap_ring,
                          uint32_t           *gpu_flap_head,
+                         uint64_t           *gpu_wqe_base,
+                         uint64_t           *gpu_batch_round,
+                         uint64_t           *gpu_submit_done,
                          cudaStream_t        stream,
                          bool                flow_initialized)
 {
@@ -607,6 +610,9 @@ static void cleanup_all(struct bridge_port *ports,
     if (gpu_drop     && gdev) doca_gpu_mem_free(gdev, gpu_drop);
     if (gpu_flap_ring && gdev) doca_gpu_mem_free(gdev, gpu_flap_ring);
     if (gpu_flap_head && gdev) doca_gpu_mem_free(gdev, gpu_flap_head);
+    if (gpu_wqe_base  && gdev) doca_gpu_mem_free(gdev, gpu_wqe_base);
+    if (gpu_batch_round && gdev) doca_gpu_mem_free(gdev, gpu_batch_round);
+    if (gpu_submit_done && gdev) doca_gpu_mem_free(gdev, gpu_submit_done);
 
     for (int p = 0; p < n_ports; p++) {
         if (ports[p].root_pipe) doca_flow_pipe_destroy(ports[p].root_pipe);
@@ -709,6 +715,12 @@ int main(int argc, char *argv[])
     struct mac_flap_record *cpu_flap_ring = NULL;
     uint32_t             *gpu_flap_head = NULL;
     uint32_t             *cpu_flap_head = NULL;
+    uint64_t             *gpu_wqe_base = NULL;
+    uint64_t             *cpu_wqe_base = NULL;
+    uint64_t             *gpu_batch_round = NULL;
+    uint64_t             *cpu_batch_round = NULL;
+    uint64_t             *gpu_submit_done = NULL;
+    uint64_t             *cpu_submit_done = NULL;
     cudaStream_t          stream       = NULL;
     bool                  flow_inited  = false;
     struct bridge_kernel_params kp     = {0};
@@ -875,6 +887,45 @@ int main(int argc, char *argv[])
     }
     *cpu_flap_head = 0;
 
+    /* wqe_base_dbg: snapshot dell'indice WQE assoluto per porta, pubblicato
+     * dal kernel subito PRIMA di ogni submit/poll (non a fine giro) — se
+     * poll_completion_at si blocca per sempre, questo resta l'ultimo valore
+     * scritto e ci dice a quale posizione del ring TXQ (wqe_base % 1024)
+     * il kernel era rimasto fermo. */
+    res = doca_gpu_mem_alloc(gdev, (size_t)n_ports * sizeof(uint64_t),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_wqe_base, (void **)&cpu_wqe_base);
+    if (res != DOCA_SUCCESS || !gpu_wqe_base) {
+        fprintf(stderr, "alloc wqe_base_dbg: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_wqe_base, 0, (size_t)n_ports * sizeof(uint64_t));
+
+    /* batch_round_dbg: contatore REALE di batch completati con successo per
+     * porta, pubblicato dal kernel insieme a wqe_base_dbg, PRIMA di ogni
+     * submit/poll. Se il kernel va in timeout, dice esattamente a quale
+     * round (non stimato dal volume di pacchetti) si è bloccato. */
+    res = doca_gpu_mem_alloc(gdev, (size_t)n_ports * sizeof(uint64_t),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_batch_round, (void **)&cpu_batch_round);
+    if (res != DOCA_SUCCESS || !gpu_batch_round) {
+        fprintf(stderr, "alloc batch_round_dbg: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_batch_round, 0, (size_t)n_ports * sizeof(uint64_t));
+
+    /* submit_done_dbg: pubblicato subito dopo che doca_gpu_dev_eth_txq_submit()
+     * ritorna, prima del poll. Distingue "bloccato dentro submit()" da
+     * "bloccato nel poll dopo" — vedi commento nel kernel. */
+    res = doca_gpu_mem_alloc(gdev, (size_t)n_ports * sizeof(uint64_t),
+                              system_page_size(), DOCA_GPU_MEM_TYPE_CPU_GPU,
+                              (void **)&gpu_submit_done, (void **)&cpu_submit_done);
+    if (res != DOCA_SUCCESS || !gpu_submit_done) {
+        fprintf(stderr, "alloc submit_done_dbg: %s\n", doca_error_get_descr(res));
+        goto cleanup;
+    }
+    memset(cpu_submit_done, 0, (size_t)n_ports * sizeof(uint64_t));
+
     /* ── 11. CUDA stream ─────────────────────────────────────────────── */
     if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
         fprintf(stderr, "cudaStreamCreateWithFlags fallita\n");
@@ -897,6 +948,9 @@ int main(int argc, char *argv[])
     kp.drop_count     = gpu_drop;
     kp.flap_ring      = gpu_flap_ring;
     kp.flap_ring_head = gpu_flap_head;
+    kp.wqe_base_dbg   = gpu_wqe_base;
+    kp.batch_round_dbg = gpu_batch_round;
+    kp.submit_done_dbg = gpu_submit_done;
 
     for (int p = 0; p < n_ports; p++) {
         kp.rxq_gpu[p] = ports[p].rxq_gpu;
@@ -950,8 +1004,18 @@ int main(int argc, char *argv[])
             printf("[live] rx_tot=%lu (", rx_sum);
             for (int p = 0; p < n_ports; p++)
                 printf("porta%d=%lu%s", p, cpu_rx_total[p], p + 1 < n_ports ? " " : "");
-            printf(")  fwd=%lu  flood=%lu  unicast=%lu  drop=%lu  mac_flaps=%u\n",
+            printf(")  fwd=%lu  flood=%lu  unicast=%lu  drop=%lu  mac_flaps=%u  wqe_base=(",
                    *cpu_fwd, *cpu_flood, *cpu_unicast, *cpu_drop, *cpu_flap_head);
+            for (int p = 0; p < n_ports; p++)
+                printf("%lu[ring_pos=%lu]%s", cpu_wqe_base[p],
+                       cpu_wqe_base[p] % MAX_SQ_DESCR_NUM, p + 1 < n_ports ? " " : "");
+            printf(")  batch_round=(");
+            for (int p = 0; p < n_ports; p++)
+                printf("%lu%s", cpu_batch_round[p], p + 1 < n_ports ? " " : "");
+            printf(")  submit_done=(");
+            for (int p = 0; p < n_ports; p++)
+                printf("%lu%s", cpu_submit_done[p], p + 1 < n_ports ? " " : "");
+            printf(")\n");
 
             uint32_t head = *cpu_flap_head;
             uint32_t new_flaps = head - last_flap_head;
@@ -984,13 +1048,25 @@ int main(int argc, char *argv[])
         printf("porta%d=%lu ", p, cpu_rx_total[p]);
     printf("\n  flood=%lu  unicast=%lu  drop=%lu  mac_flaps totali=%u\n",
            *cpu_flood, *cpu_unicast, *cpu_drop, *cpu_flap_head);
+    printf("  wqe_base finale: ");
+    for (int p = 0; p < n_ports; p++)
+        printf("porta%d=%lu[ring_pos=%lu] ", p, cpu_wqe_base[p],
+               cpu_wqe_base[p] % MAX_SQ_DESCR_NUM);
+    printf("\n  batch_round finale: ");
+    for (int p = 0; p < n_ports; p++)
+        printf("porta%d=%lu ", p, cpu_batch_round[p]);
+    printf("\n  submit_done finale: ");
+    for (int p = 0; p < n_ports; p++)
+        printf("porta%d=%lu ", p, cpu_submit_done[p]);
+    printf("\n");
 
 cleanup:
     /* gpu_exit, gpu_fwd e i contatori diagnostici vengono liberati dentro cleanup_all */
     cleanup_all(ports, n_ports, gdev, mac_table_gpu,
                 gpu_exit, gpu_fwd,
                 gpu_rx_total, gpu_flood, gpu_unicast, gpu_drop,
-                gpu_flap_ring, gpu_flap_head,
+                gpu_flap_ring, gpu_flap_head, gpu_wqe_base, gpu_batch_round,
+                gpu_submit_done,
                 stream, flow_inited);
     printf("Done.\n");
     return (res == DOCA_SUCCESS) ? 0 : 1;

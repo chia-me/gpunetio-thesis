@@ -74,9 +74,18 @@
  *
  * MAX_SQ_DESCR_NUM: Work Queue Entry (WQE) nel Send Queue della TXQ.
  *   Con flooding a N porte, ogni pacchetto può generare N-1 WQE.
- *   1024 WQE è conservativo; la NIC li consuma velocemente.
+ *   1024 WQE è conservativo.
  */
-#define MAX_SQ_DESCR_NUM  1024
+#define MAX_SQ_DESCR_NUM  2048
+
+/* POLL_NB_TIMEOUT_ITERS: numero massimo di controlli non bloccanti (NB) su
+ * una singola CQE attesa prima di considerarla "mai arrivata" e abortire
+ * in modo pulito invece di restare bloccati per sempre in poll_completion_at
+ * (WAIT_FLAG_B). Valore scelto empiricamente, non calibrato su un tempo
+ * reale preciso: se in pratica scatta durante condizioni di carico normali
+ * (falsi positivi), va alzato; se il freeze reale richiede troppo tempo per
+ * essere rilevato, va abbassato. */
+#define POLL_NB_TIMEOUT_ITERS  20000000u
 
 /* =========================================================================
  * COSTANTI — DOCA FLOW
@@ -217,6 +226,27 @@ struct bridge_kernel_params {
     uint64_t *flood_count;    /* pacchetti floodati (dst MAC sconosciuto) */
     uint64_t *unicast_count;  /* pacchetti forwardati per unicast lookup */
     uint64_t *drop_count;     /* pacchetti droppati (dst sulla stessa porta src) */
+    uint64_t *wqe_base_dbg;   /* [n_ports]: snapshot di wqe_base[q] (indice WQE
+                                * assoluto, sempre crescente — NON si resetta al
+                                * wraparound del ring; la posizione fisica è
+                                * wqe_base % MAX_SQ_DESCR_NUM). Serve a capire,
+                                * se il kernel si blocca dentro poll_completion_at,
+                                * a che punto del ring TXQ era rimasto fermo. */
+    uint64_t *submit_done_dbg; /* [n_ports]: pubblicato SUBITO DOPO che
+                                * doca_gpu_dev_eth_txq_submit() ritorna, PRIMA
+                                * di iniziare il poll. Se al freeze wqe_base_dbg
+                                * si è aggiornato ma submit_done_dbg no, il
+                                * blocco è dentro submit() (es. nello spinlock
+                                * doca_gpu_dev_eth_lock); se anche
+                                * submit_done_dbg è aggiornato, il blocco è nel
+                                * poll dopo, non dentro submit(). */
+    uint64_t *batch_round_dbg; /* [n_ports]: numero REALE di batch/round completati
+                                * con successo per la TXQ q (incrementato una volta
+                                * per esecuzione di Fase 3, esattamente insieme a
+                                * cqe_idx[q] += 1). Pubblicato PRIMA del submit/poll
+                                * del batch successivo, quindi al momento di un
+                                * eventuale freeze riflette l'ultimo round riuscito
+                                * (il round bloccato è batch_round_dbg[q]+1). */
     struct mac_flap_record *flap_ring;  /* [FLAP_RING_SIZE] */
     uint32_t *flap_ring_head;           /* contatore monotono totale flap */
 };
